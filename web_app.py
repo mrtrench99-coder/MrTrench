@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import http.cookies
 import threading
 import time
 import urllib.error
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 from background_agent import DEFAULT_MODEL, GROQ_BASE_URL, process_due_triggers, run_cycle
 from chat_interface import chat_turn
 from thought_memory import ThoughtMemory
+import multiuser
 
 
 ROOT = Path(__file__).resolve().parent
@@ -23,7 +25,7 @@ DB_PATH = os.getenv("THOUGHT_DB", str(ROOT / "thought_memory.sqlite3"))
 memory = ThoughtMemory(DB_PATH)
 state_lock = threading.RLock()
 settings_lock = threading.RLock()
-settings: dict[str, object] = {
+local_settings: dict[str, object] = {
     "api_key": os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
     "model": os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
     "base_url": os.getenv("OPENAI_BASE_URL", GROQ_BASE_URL),
@@ -32,6 +34,21 @@ settings: dict[str, object] = {
     "last_cycle_at": None,
     "last_worker_error": "",
 }
+tenant_locks: dict[str, threading.RLock] = {}
+tenant_locks_guard = threading.Lock()
+
+
+def _lock_for(user_id: str) -> threading.RLock:
+    with tenant_locks_guard:
+        return tenant_locks.setdefault(user_id, threading.RLock())
+
+
+def _settings_for(user_id: str | None) -> dict[str, object]:
+    return local_settings if user_id is None else multiuser.load_settings(user_id)
+
+
+def _memory_for(user_id: str | None) -> ThoughtMemory:
+    return memory if user_id is None else ThoughtMemory(multiuser.tenant_database(user_id))
 
 
 def _clean_base_url(value: object) -> str:
@@ -39,6 +56,8 @@ def _clean_base_url(value: object) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
         raise ValueError("Enter a valid http or https API base URL.")
+    if multiuser.HOSTED_MODE and url.lower() != GROQ_BASE_URL.lower():
+        raise ValueError("Hosted beta currently supports the official Groq API endpoint only.")
     return url
 
 
@@ -77,77 +96,96 @@ def _probe_provider(api_key: str, base_url: str, model: str) -> dict[str, object
     return {"ok": True, "message": f"Connection successful. The provider accepted the key and returned {len(ids)} available model(s)."}
 
 
-def _snapshot() -> dict[str, object]:
-    with state_lock, settings_lock:
+def _snapshot(user_id: str | None = None) -> dict[str, object]:
+    store, user_settings = _memory_for(user_id), _settings_for(user_id)
+    lock = state_lock if user_id is None else _lock_for(user_id)
+    with lock, settings_lock:
         return {
-            "messages": memory.recent_conversation(limit=100),
-            "proactive_messages": memory.recent_messages(limit=30),
-            "threads": memory.list_threads(status="active", limit=30)
-            + memory.list_threads(status="suspended", limit=30),
-            "memories": memory.recent_memories(limit=50),
-            "follow_ups": memory.pending_triggers(limit=100),
-            "proactive_paused": memory.proactive_paused(),
+            "messages": store.recent_conversation(limit=100),
+            "proactive_messages": store.recent_messages(limit=30),
+            "threads": store.list_threads(status="active", limit=30)
+            + store.list_threads(status="suspended", limit=30),
+            "memories": store.recent_memories(limit=50),
+            "follow_ups": store.pending_triggers(limit=100),
+            "proactive_paused": store.proactive_paused(),
             "worker": {
-                "enabled": bool(settings["worker_enabled"]),
-                "configured": bool(settings["api_key"]),
-                "last_cycle_at": settings["last_cycle_at"],
-                "last_error": settings["last_worker_error"],
-                "interval_seconds": settings["interval_seconds"],
-                "model": settings["model"],
-                "base_url": settings["base_url"],
+                "enabled": bool(user_settings["worker_enabled"]),
+                "configured": bool(user_settings["api_key"]),
+                "last_cycle_at": user_settings["last_cycle_at"],
+                "last_error": user_settings["last_worker_error"],
+                "interval_seconds": user_settings["interval_seconds"],
+                "model": user_settings["model"],
+                "base_url": user_settings["base_url"],
             },
         }
 
 
 def _background_loop() -> None:
-    current_interval = int(settings["interval_seconds"])
-    next_review = time.monotonic() + current_interval
-    retry_after = 0.0
     while True:
         time.sleep(2)
-        with settings_lock:
-            enabled = bool(settings["worker_enabled"] and settings["api_key"])
-            api_key = str(settings["api_key"])
-            model = str(settings["model"])
-            base_url = str(settings["base_url"])
-            interval = int(settings["interval_seconds"])
-        if interval != current_interval:
-            current_interval = interval
-            next_review = time.monotonic() + interval
-        if not enabled:
-            next_review = time.monotonic() + interval
-            continue
-        if time.monotonic() < retry_after:
-            continue
-        try:
-            with state_lock:
-                process_due_triggers(memory, model=model, api_key=api_key, base_url=base_url)
-                if time.monotonic() >= next_review:
-                    run_cycle(memory, model=model, api_key=api_key, base_url=base_url)
-                    next_review = time.monotonic() + interval
-                    with settings_lock:
-                        settings["last_cycle_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                        settings["last_worker_error"] = ""
-        except Exception as exc:  # keep the local UI alive when a provider is unavailable
-            with settings_lock:
-                settings["last_worker_error"] = str(exc)[:1000]
-            retry_after = time.monotonic() + 30
+        tenants = [None] if not multiuser.HOSTED_MODE else multiuser.registered_tenants()
+        for user_id in tenants:
+            try:
+                user_settings = _settings_for(user_id)
+                if not (user_settings["worker_enabled"] and user_settings["api_key"]):
+                    continue
+                interval = int(user_settings["interval_seconds"])
+                now = time.monotonic()
+                next_review = getattr(_background_loop, "next_review", {})
+                retry_map = getattr(_background_loop, "retry_after", {})
+                next_review.setdefault(str(user_id), now + interval)
+                retry_map.setdefault(str(user_id), 0.0)
+                if now < retry_map[str(user_id)]:
+                    continue
+                store = _memory_for(user_id)
+                lock = state_lock if user_id is None else _lock_for(user_id)
+                with lock:
+                    process_due_triggers(store, model=str(user_settings["model"]),
+                                         api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
+                    if now >= next_review[str(user_id)]:
+                        run_cycle(store, model=str(user_settings["model"]),
+                                  api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
+                        next_review[str(user_id)] = now + interval
+                        user_settings["last_cycle_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                        user_settings["last_worker_error"] = ""
+                        if user_id is not None:
+                            multiuser.save_settings(user_id, user_settings)
+                        with settings_lock:
+                            local_settings["last_cycle_at"] = user_settings["last_cycle_at"]
+                setattr(_background_loop, "next_review", next_review)
+                setattr(_background_loop, "retry_after", retry_map)
+            except Exception as exc:  # keep the UI alive when a provider is unavailable
+                if user_id is not None:
+                    try:
+                        user_settings = _settings_for(user_id)
+                        user_settings["last_worker_error"] = str(exc)[:1000]
+                        multiuser.save_settings(user_id, user_settings)
+                    except Exception:
+                        pass
+                with settings_lock:
+                    local_settings["last_worker_error"] = str(exc)[:1000]
+                retry_map = getattr(_background_loop, "retry_after", {})
+                retry_map[str(user_id)] = time.monotonic() + 30
+                setattr(_background_loop, "retry_after", retry_map)
 
 
 class MrTrenchHandler(BaseHTTPRequestHandler):
-    server_version = "MrTrenchLocal/1.0"
+    server_version = "MrTrench/1.0"
 
     def log_message(self, _format: str, *_args: object) -> None:
         # Avoid writing chat contents or local API activity to terminal logs.
         return
 
-    def _json(self, value: object, status: int = 200) -> None:
+    def _json(self, value: object, status: int = 200, headers: dict[str, object] | None = None) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for name, header_value in (headers or {}).items():
+            for item in (header_value if isinstance(header_value, list) else [header_value]):
+                self.send_header(name, str(item))
         self.end_headers()
         self.wfile.write(body)
 
@@ -167,25 +205,76 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
     def _same_origin(self) -> bool:
         origin = self.headers.get("Origin")
         host = self.headers.get("Host", "").lower()
-        allowed_hosts = {
-            f"127.0.0.1:{self.server.server_port}",
-            f"localhost:{self.server.server_port}",
-        }
-        return host in allowed_hosts and (not origin or urlparse(origin).netloc.lower() == host)
+        return bool(host) and (not origin or urlparse(origin).netloc.lower() == host)
 
     def _trusted_host(self) -> bool:
         host = self.headers.get("Host", "").lower()
-        return host in {
-            f"127.0.0.1:{self.server.server_port}",
-            f"localhost:{self.server.server_port}",
-        }
+        allowed = {item.strip().lower() for item in os.getenv("MR_TRENCH_ALLOWED_HOSTS", "").split(",") if item.strip()}
+        if not multiuser.HOSTED_MODE:
+            allowed.update({f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"})
+        return host in allowed if allowed else (not multiuser.HOSTED_MODE and bool(host))
+
+    def _cookie(self, name: str) -> str:
+        cookies = http.cookies.SimpleCookie()
+        try:
+            cookies.load(self.headers.get("Cookie", ""))
+            return cookies[name].value if name in cookies else ""
+        except http.cookies.CookieError:
+            return ""
+
+    def _session_headers(self, access: str = "", refresh: str = "", *, clear: bool = False) -> dict[str, object]:
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+        if clear:
+            return {"Set-Cookie": [f"mrtrench_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+                                   f"mrtrench_refresh=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{secure}"]}
+        if not access or not refresh:
+            return {}
+        return {"Set-Cookie": [f"mrtrench_session={access}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600{secure}",
+                               f"mrtrench_refresh={refresh}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{secure}"]}
+
+    def _current_user(self) -> tuple[str | None, dict[str, Any] | None]:
+        if not multiuser.HOSTED_MODE:
+            return None, None
+        token = self._cookie("mrtrench_session")
+        user = multiuser.user_for_token(token)
+        if user:
+            return str(user["id"]).lower(), user
+        refresh_token = self._cookie("mrtrench_refresh")
+        if refresh_token:
+            try:
+                session = multiuser.refresh_session(refresh_token)
+                token = str(session.get("access_token", ""))
+                user = multiuser.user_for_token(token)
+                if user:
+                    self._auth_cookie_headers = self._session_headers(
+                        token, str(session.get("refresh_token", refresh_token)))
+                    return str(user["id"]).lower(), user
+            except ValueError:
+                pass
+        return None, None
+
+    def _require_user(self) -> tuple[str | None, dict[str, Any] | None]:
+        user_id, user = self._current_user()
+        if multiuser.HOSTED_MODE and not user_id:
+            raise PermissionError("Please sign in to continue.")
+        return user_id, user
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._trusted_host():
             self.send_error(403)
             return
+        if self.path == "/api/auth/session":
+            user_id, user = self._current_user()
+            headers = getattr(self, "_auth_cookie_headers", {})
+            self._json({"hosted": multiuser.HOSTED_MODE, "authenticated": bool(user_id),
+                        "user": {"email": user.get("email", "")} if user else None}, headers=headers)
+            return
         if self.path == "/api/state":
-            self._json(_snapshot())
+            try:
+                user_id, _ = self._require_user()
+                self._json(_snapshot(user_id), headers=getattr(self, "_auth_cookie_headers", {}))
+            except PermissionError as exc:
+                self._json({"error": str(exc)}, 401)
             return
         relative = "index.html" if self.path in {"/", "/index.html"} else self.path.lstrip("/")
         target = (WEB_ROOT / relative).resolve()
@@ -211,72 +300,114 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self._body()
+            if self.path == "/api/auth/signup":
+                if not multiuser.HOSTED_MODE:
+                    raise ValueError("Account sign-in is not enabled in local mode.")
+                result = multiuser.sign_up(str(body.get("email", "")).strip(), str(body.get("password", "")))
+                if result.get("access_token") and result.get("refresh_token"):
+                    self._json({"ok": True, "authenticated": True, "message": "Account created."}, headers=self._session_headers(
+                        str(result["access_token"]), str(result.get("refresh_token", ""))))
+                else:
+                    self._json({"ok": True, "message": "Check your email to confirm the account, then sign in."})
+                return
+            if self.path == "/api/auth/login":
+                if not multiuser.HOSTED_MODE:
+                    raise ValueError("Account sign-in is not enabled in local mode.")
+                result = multiuser.sign_in(str(body.get("email", "")).strip(), str(body.get("password", "")))
+                if not result.get("access_token") or not result.get("refresh_token"):
+                    raise ValueError("The account service did not return a sign-in session. Confirm your email and try again.")
+                self._json({"ok": True, "email": str(result.get("user", {}).get("email", ""))},
+                           headers=self._session_headers(str(result["access_token"]), str(result["refresh_token"])))
+                return
+            if self.path == "/api/auth/logout":
+                self._json({"ok": True}, headers=self._session_headers(clear=True))
+                return
+            user_id, _ = self._require_user()
+            store, user_settings = _memory_for(user_id), _settings_for(user_id)
+            lock = state_lock if user_id is None else _lock_for(user_id)
             if self.path == "/api/chat":
                 text = str(body.get("message", "")).strip()
                 if not text:
                     raise ValueError("Write a message first.")
-                with settings_lock:
-                    api_key = str(settings["api_key"])
-                    model = str(settings["model"])
-                    base_url = str(settings["base_url"])
+                api_key = str(user_settings["api_key"])
+                model = str(user_settings["model"])
+                base_url = str(user_settings["base_url"])
                 if not api_key:
                     raise ValueError("Add your API key in Settings before chatting.")
-                with state_lock:
-                    reply = chat_turn(memory, text, model=model, api_key=api_key, base_url=base_url)
-                self._json({"reply": reply})
+                with lock:
+                    reply = chat_turn(store, text, model=model, api_key=api_key, base_url=base_url)
+                self._json({"reply": reply}, headers=getattr(self, "_auth_cookie_headers", {}))
             elif self.path == "/api/test-connection":
-                with settings_lock:
-                    api_key = str(body.get("api_key", "")).strip() or str(settings["api_key"])
-                    base_url = _clean_base_url(body.get("base_url", settings["base_url"]))
-                    model = str(body.get("model", settings["model"])).strip()
+                api_key = str(body.get("api_key", "")).strip() or str(user_settings["api_key"])
+                base_url = _clean_base_url(body.get("base_url", user_settings["base_url"]))
+                model = str(body.get("model", user_settings["model"])).strip()
                 if not api_key:
                     raise ValueError("Paste an API key first, then test the connection.")
-                self._json(_probe_provider(api_key, base_url, model))
+                self._json(_probe_provider(api_key, base_url, model), headers=getattr(self, "_auth_cookie_headers", {}))
             elif self.path == "/api/settings":
-                model = str(body.get("model", settings["model"])).strip()
+                model = str(body.get("model", user_settings["model"])).strip()
                 if not model:
                     raise ValueError("Model name cannot be empty.")
-                base_url = _clean_base_url(body.get("base_url", settings["base_url"]))
-                with settings_lock:
-                    if "api_key" in body and str(body["api_key"]).strip():
-                        settings["api_key"] = str(body["api_key"]).strip()
-                    settings["model"] = model
-                    settings["base_url"] = base_url
-                    settings["interval_seconds"] = max(60, min(86400, int(body.get("interval_minutes", 30)) * 60))
-                    settings["worker_enabled"] = bool(body.get("worker_enabled", True)) and bool(settings["api_key"])
-                    settings["last_worker_error"] = ""
+                base_url = _clean_base_url(body.get("base_url", user_settings["base_url"]))
+                if "api_key" in body and str(body["api_key"]).strip():
+                    user_settings["api_key"] = str(body["api_key"]).strip()
+                user_settings["model"] = model
+                user_settings["base_url"] = base_url
+                user_settings["interval_seconds"] = max(60, min(86400, int(body.get("interval_minutes", 30)) * 60))
+                user_settings["worker_enabled"] = bool(body.get("worker_enabled", True)) and bool(user_settings["api_key"])
+                user_settings["last_worker_error"] = ""
+                if user_id is None:
+                    local_settings.update(user_settings)
+                else:
+                    multiuser.save_settings(user_id, user_settings)
                 self._json({"ok": True})
             elif self.path == "/api/worker":
-                with settings_lock:
-                    if not settings["api_key"]:
-                        raise ValueError("Add an API key in Settings before starting the background worker.")
-                    settings["worker_enabled"] = bool(body.get("enabled", False))
-                    settings["last_worker_error"] = ""
+                if not user_settings["api_key"]:
+                    raise ValueError("Add an API key in Settings before starting the background worker.")
+                user_settings["worker_enabled"] = bool(body.get("enabled", False))
+                user_settings["last_worker_error"] = ""
+                if user_id is None:
+                    local_settings.update(user_settings)
+                else:
+                    multiuser.save_settings(user_id, user_settings)
+                self._json({"ok": True})
+            elif self.path == "/api/settings/forget-key":
+                user_settings["api_key"] = ""
+                user_settings["worker_enabled"] = False
+                user_settings["last_worker_error"] = ""
+                if user_id is None:
+                    local_settings.update(user_settings)
+                else:
+                    multiuser.save_settings(user_id, user_settings)
                 self._json({"ok": True})
             elif self.path == "/api/review":
-                with settings_lock:
-                    if not settings["api_key"]:
-                        raise ValueError("Add an API key in Settings first.")
-                    api_key, model, base_url = str(settings["api_key"]), str(settings["model"]), str(settings["base_url"])
-                with state_lock:
-                    result = run_cycle(memory, model=model, api_key=api_key, base_url=base_url)
-                with settings_lock:
-                    settings["last_cycle_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                if not user_settings["api_key"]:
+                    raise ValueError("Add an API key in Settings first.")
+                api_key, model, base_url = str(user_settings["api_key"]), str(user_settings["model"]), str(user_settings["base_url"])
+                with lock:
+                    result = run_cycle(store, model=model, api_key=api_key, base_url=base_url)
+                user_settings["last_cycle_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                if user_id is None:
+                    local_settings.update(user_settings)
+                else:
+                    multiuser.save_settings(user_id, user_settings)
                 self._json({"ok": True, "queued": bool(result.get("queued_message"))})
             elif self.path == "/api/pause":
                 paused = bool(body.get("paused", True))
-                with state_lock:
-                    memory.set_proactive_pause(paused, note="Changed from the local web interface.")
+                with lock:
+                    store.set_proactive_pause(paused, note="Changed from the web interface.")
                 self._json({"ok": True})
             elif self.path == "/api/followups/cancel":
                 trigger_id = str(body.get("id", ""))
                 if not trigger_id:
                     raise ValueError("Choose a follow-up to cancel.")
-                with state_lock:
-                    memory.cancel_trigger(trigger_id, note="Cancelled from the local web interface.")
+                with lock:
+                    store.cancel_trigger(trigger_id, note="Cancelled from the web interface.")
                 self._json({"ok": True})
             else:
                 self._json({"error": "Not found."}, 404)
+        except PermissionError as exc:
+            self._json({"error": str(exc)}, 401)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             self._json({"error": str(exc)}, 400)
         except Exception as exc:
@@ -284,10 +415,18 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if multiuser.HOSTED_MODE:
+        multiuser.require_config()
     threading.Thread(target=_background_loop, name="mrtrench-background", daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", int(os.getenv("MR_TRENCH_PORT", "8765"))), MrTrenchHandler)
-    print(f"MrTrench is ready at http://127.0.0.1:{server.server_port}")
-    print("This local server keeps your API key in memory only; use Ctrl+C to stop it.")
+    if multiuser.HOSTED_MODE:
+        allowed = os.getenv("MR_TRENCH_ALLOWED_HOSTS") or os.getenv("RENDER_EXTERNAL_HOSTNAME", "")
+        if not allowed:
+            raise RuntimeError("Set MR_TRENCH_ALLOWED_HOSTS to the public app hostname.")
+        os.environ["MR_TRENCH_ALLOWED_HOSTS"] = allowed
+    host = "0.0.0.0" if multiuser.HOSTED_MODE else "127.0.0.1"
+    port = int(os.getenv("PORT", os.getenv("MR_TRENCH_PORT", "8765")))
+    server = ThreadingHTTPServer((host, port), MrTrenchHandler)
+    print(f"MrTrench is listening on {host}:{server.server_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

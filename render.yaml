@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: mrtrench
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python web_app.py
+    healthCheckPath: /api/auth/session
+    disk:
+      name: mrtrench-user-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    envVars:
+      - key: MR_TRENCH_MODE
+        value: hosted
+      - key: MR_TRENCH_DATA_DIR
+        value: /opt/render/project/src/data/users
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: MR_TRENCH_ENCRYPTION_KEY
+        sync: false

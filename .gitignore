@@ -1,6 +1,7 @@
 # Local conversation, memory, and configuration data
 thought_memory.sqlite3
 thought_memory.sqlite3-*
+data/
 .env
 .env.*
 !.env.example
