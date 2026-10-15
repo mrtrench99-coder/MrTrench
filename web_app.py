@@ -146,7 +146,9 @@ def _snapshot(user_id: str | None = None, access_token: str = "") -> dict[str, o
             "threads": store.list_threads(status="active", limit=30)
             + store.list_threads(status="suspended", limit=30),
             "memories": store.recent_memories(limit=50),
-            "follow_ups": store.pending_triggers(limit=100),
+            # Emotion-based check-ins are internal attention cues, not user-facing tasks.
+            "follow_ups": [item for item in store.pending_triggers(limit=100)
+                           if item.get("purpose") != "mood"],
             "proactive_paused": store.proactive_paused(),
             "worker": {
                 "enabled": bool(user_settings["worker_enabled"]),
