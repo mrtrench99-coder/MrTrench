@@ -7,6 +7,8 @@ An experimental assistant application for persistent thoughts, long-term memory,
 - `thought_memory.py` implements the SQLite-backed conversation, thought, memory, and follow-up store.
 - `chat_interface.py` provides interactive chat, updates cognitive state, and schedules up to 10 separate follow-ups from one message.
 - `background_agent.py` evaluates due follow-ups and periodically reflects on recent conversation and thought state.
+- `web_app.py` serves a local browser UI for chat, threads, memories, follow-ups, and background controls; `web/index.html` contains its responsive interface and color themes.
+- `web/mrtrench-logo.png` is the current UI logo asset.
 - `thought_memory.sqlite3` is created locally and contains conversation and memory data. It is excluded from Git; do not publish or share it.
 
 Keep your API key in the `GROQ_API_KEY` environment variable. Do not paste a real key into source code, the README, or a committed `.env` file. The repository's `.gitignore` excludes the local database, environment files, and Python cache files.
@@ -41,6 +43,26 @@ Emotion support follows a similarly cautious approach: notice what the user actu
 The memory retriever is lexical and can miss paraphrases; importance and affect are model estimates; a hosted model may still make mistakes; and a scheduled background cycle can only use information saved in this database. The inspiration is cognitive architecture research, not evidence that MrTrench has subjective experience. Proactive messages can feel intrusive or create unhealthy attachment, so silence, user controls, low message limits, transparent timing, and no engagement-maximizing objective are core behavior requirements.
 
 ## Start a conversation
+
+### Browser interface
+
+Run one local process from the project folder:
+
+```powershell
+python .\web_app.py
+```
+
+Open `http://127.0.0.1:8765` in your browser. Add the Groq API key under **Settings**; the web app keeps a key entered there in memory for the current run and does not save it to disk. **Test API key** checks provider authentication without making a model completion. It distinguishes `invalid_api_key` responses from provider 403 access/security errors and 429 rate/quota errors. The interface includes the conversation, saved thought threads, memories, follow-ups, a background worker toggle, a manual reflection button, an outreach pause, and selectable color themes. The default graphite theme uses a black background with soft grey panels. The app is bound to localhost; it is not yet deployed for public sharing. Stop it with Ctrl+C in that one terminal window.
+
+### Public multi-user hosting status
+
+Do not expose the current web app directly to the public internet. It has no accounts yet, and its SQLite database and in-memory provider settings belong to one local user. The requested public beta should give each person a separate account and memory store, and let each person use their own provider key. That requires authentication, per-user data isolation, protected per-user key handling, request limits, and a production web server before deployment.
+
+One practical route is a Render web service for the Python app plus Supabase Auth/Postgres for accounts and isolated user data. Supabase recommends enabling Row Level Security on exposed tables and writing per-user policies. Render can keep deployment secrets in service environment variables; its service filesystem is ephemeral by default, and persistent disks are available for paid services. For a multi-user service, a managed database with access policies is preferable to sharing this prototype's SQLite file. See the [Supabase RLS guide](https://supabase.com/docs/guides/database/postgres/row-level-security), [Render environment variables and secrets](https://render.com/docs/configure-environment-variables), and [Render persistent disks](https://render.com/docs/disks).
+
+Groq keys must stay server-side and should never be committed or embedded in the browser bundle. Groq's security guidance recommends environment variables or secret management and revoking exposed keys. The current local Settings form sends the key only to the localhost backend and does not save it; the public BYOK flow will need authenticated transport, per-user protection, and a clear delete/forget control. See [Groq's security onboarding](https://console.groq.com/docs/production-readiness/security-onboarding) and [OpenAI-compatible endpoint setup](https://console.groq.com/docs/openai).
+
+The terminal interfaces below are still available if preferred.
 
 In PowerShell, set your Groq key in the current window and start the chat:
 
