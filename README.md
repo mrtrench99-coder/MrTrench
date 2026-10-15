@@ -1,21 +1,26 @@
 # MrTrench
 
-An experimental assistant prototype for persistent thoughts, memory, and autonomous follow-ups.
-
-This prototype has an interactive conversation plus an optional slower idle reflection loop.
+An experimental assistant application for persistent thoughts, long-term memory, and proactive follow-ups. It uses a hosted LLM through an OpenAI-compatible API; it is not a newly trained or fine-tuned model.
 
 ## Project files and local data
 
 - `thought_memory.py` implements the SQLite-backed conversation, thought, memory, and follow-up store.
-- `chat_interface.py` provides the interactive chat and schedules up to 10 separate follow-ups from one message.
-- `background_agent.py` evaluates due follow-ups and performs periodic reflection.
+- `chat_interface.py` provides interactive chat, updates cognitive state, and schedules up to 10 separate follow-ups from one message.
+- `background_agent.py` evaluates due follow-ups and periodically reflects on recent conversation and thought state.
 - `thought_memory.sqlite3` is created locally and contains conversation and memory data. It is excluded from Git; do not publish or share it.
 
 Keep your API key in the `GROQ_API_KEY` environment variable. Do not paste a real key into source code, the README, or a committed `.env` file. The repository's `.gitignore` excludes the local database, environment files, and Python cache files.
+## How the prototype works
 
-- `thought_memory.py` stores conversation history, resumable thought threads, durable memories, links, events, timed triggers, and initiated messages in SQLite.
-- `chat_interface.py` answers each user message immediately and lets the model update durable cognitive state when useful.
-- `background_agent.py` watches pending reminders/check-ins and reviews recent conversation and thought state during quiet periods. It checks timers every five seconds and does a deeper idle review every 30 minutes.
+The chat process sends each user turn and relevant saved context to the configured LLM. It stores the conversation, selected durable memories, thought threads, and timed triggers in SQLite. A separate background process checks due triggers every five seconds and asks the LLM to decide whether each follow-up is still relevant. It also runs a reflection cycle every 30 minutes by default.
+
+The model is called when a chat turn, due trigger, or reflection cycle needs it; it is not continuously thinking between calls. The worker prints proactive messages in its terminal and stores them in the local outbox. No phone, email, or external chat notification is connected. Leave the worker and computer running for near-time follow-up delivery.
+
+## Project status
+
+This is an early research prototype for experimenting with stateful, cognition-inspired interaction. The current implementation provides persistent conversation history, resumable thought threads, durable memories, cross-thread links, time-based reminders, low-mood check-ins, and periodic background reflection. Its cognitive behavior comes from application logic and LLM prompts; it does not model or reproduce human cognition, and memory quality depends on the configured model and the context sent to it.
+
+The default LLM endpoint is Groq's OpenAI-compatible API with `openai/gpt-oss-20b`. Hosted providers can impose rate limits; a rate-limited request may need to be retried after the wait period stated in the error.
 
 ## Start a conversation
 
@@ -57,4 +62,13 @@ Each chat turn, due-trigger decision, and idle review makes a hosted model call.
 
 ## GitHub development workflow
 
-After connecting this folder to a GitHub repository, make a focused commit for each completed feature or fix. Update this README whenever commands, behavior, or setup steps change. Before pushing, check `git status` and confirm that `thought_memory.sqlite3`, API keys, and other private data are not staged. Use commit messages that describe the change, such as `Support multiple reminders per message`.
+The default branch is `main`. For this solo prototype, small changes can be committed directly to `main`; a separate branch is optional for larger experiments. A typical update is:
+
+```powershell
+git status
+git add README.md chat_interface.py
+git commit -m "Describe the change"
+git push
+```
+
+GitHub's **Commits** view shows the project history. Update this README when setup steps or behavior change, and check that the local SQLite database and API keys are not staged before committing.
