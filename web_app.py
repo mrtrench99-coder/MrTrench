@@ -98,7 +98,13 @@ def _clean_base_url(value: object) -> str:
 def _probe_provider(api_key: str, base_url: str, model: str) -> dict[str, object]:
     request = urllib.request.Request(
         f"{_clean_base_url(base_url)}/models",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            # Cloudflare in front of Groq may reject urllib's default
+            # Python-urllib user agent with Error 1010.
+            "User-Agent": "thought-memory-web/0.1",
+        },
         method="GET",
     )
     try:
