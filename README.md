@@ -1,4 +1,6 @@
-# Persistent thought prototype
+# MrTrench
+
+An experimental assistant prototype for persistent thoughts, memory, and autonomous follow-ups.
 
 This prototype has an interactive conversation plus an optional slower idle reflection loop.
 
