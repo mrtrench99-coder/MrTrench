@@ -1,0 +1,16 @@
+# Local conversation, memory, and configuration data
+thought_memory.sqlite3
+thought_memory.sqlite3-*
+.env
+.env.*
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
