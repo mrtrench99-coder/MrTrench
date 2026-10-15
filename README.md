@@ -54,30 +54,29 @@ python .\web_app.py
 
 Open `http://127.0.0.1:8765` in your browser. Add the Groq API key under **Settings**; in local mode, the key stays in memory for the current run and is not saved to disk. **Test API key** checks provider authentication without making a model completion. It distinguishes `invalid_api_key` responses from provider 403 access/security errors and 429 rate/quota errors. The interface includes the conversation, saved thought threads, memories, follow-ups, a background worker toggle, a manual reflection button, an outreach pause, and selectable color themes. The default graphite theme uses a black background with soft grey panels. Stop it with Ctrl+C in that one terminal window.
 
-### Multi-user hosted beta
+### Free multi-user hosted beta
 
-Hosted mode now has Supabase Auth sign-up/sign-in, HTTP-only session cookies, a separate SQLite database per authenticated account, and a per-account Groq key encrypted with Fernet on the server. The browser never receives a saved key. Each account's background worker reads only that account's encrypted settings and database. Local mode keeps its existing single-user behavior.
+Hosted mode uses Supabase Auth for sign-up/sign-in and a Supabase Postgres row per account for its saved thought database and encrypted provider settings. The browser never receives a saved Groq key. Row Level Security restricts each account to its own row. Local mode keeps its existing SQLite behavior.
 
-This is an experimental, single-instance beta foundation. Its per-account SQLite files must live on a persistent disk; do not scale the web service to multiple instances or remove the disk. Memory and conversation databases are not encrypted by the app at rest (only saved provider keys are Fernet-encrypted). The current threaded HTTP server and in-process worker still need production hardening (rate limits, monitoring, backups, and an external job queue) before inviting the public at scale. User data is not migrated from the local `thought_memory.sqlite3` into hosted accounts. Hosted mode currently restricts model requests to Groq's official endpoint.
+This is a free-tier prototype, not a production service. Render Free sleeps after 15 minutes without traffic and has no persistent filesystem; memory data is stored in Supabase for that reason. Supabase Free projects may pause after a week of low database activity. The background process stops while Render sleeps, so check-ins and reminders may be late until someone visits the app again. User data is not migrated from the local `thought_memory.sqlite3`. Hosted mode currently restricts model requests to Groq's official endpoint. See [Render free service limits](https://render.com/docs/free) and [Supabase project pausing](https://supabase.com/docs/guides/platform/free-project-pausing).
 
-#### Deploy on Render
+#### Set up the free host
 
-1. Create a Supabase project. In **Authentication → Providers → Email**, enable email/password sign-in and choose whether email confirmation is required. In **Authentication → URL Configuration**, add the eventual Render URL as a site URL/redirect URL.
-2. In the Supabase project settings, copy the project URL and the publishable/legacy `anon` key. These are used by the server to call Supabase Auth; never use the `service_role` key here.
-3. Install dependencies locally, then generate a Fernet key for Render's `MR_TRENCH_ENCRYPTION_KEY` secret:
+1. In the Supabase project, enable email/password sign-in under **Authentication → Providers → Email**. Choose whether email confirmation is required.
+2. Open **SQL Editor**, paste the contents of `supabase/schema.sql`, and run it. This creates the per-account storage table and Row Level Security policy.
+3. Copy the **Project URL** and **Publishable key**. The app calls the publishable key `SUPABASE_ANON_KEY` in its environment. Do not use the Supabase Secret key or a `service_role` key.
+4. Generate an encryption key in PowerShell:
 
    ```powershell
    python -m pip install -r requirements.txt
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
 
-   Save the generated value in a password manager before putting it in Render. Losing or changing this key makes saved provider keys unreadable. Do not commit it.
-4. In Render, choose **New → Blueprint**, connect this GitHub repository, and apply `render.yaml`. Set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `MR_TRENCH_ENCRYPTION_KEY` as secret environment variables. The blueprint creates a paid single-instance service with a persistent disk mounted for account data.
-5. Deploy, open the Render URL, create an account, confirm the email if requested, sign in, and add that account's Groq key under **Settings**. Each user repeats this for their own account and key.
+   Save it privately. Losing or changing it makes stored provider keys unreadable. Never commit it.
+5. Push the project to GitHub. In Render, choose **New → Blueprint**, connect this repository's `main` branch, and review the plan. `render.yaml` selects the Free service and asks for `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `MR_TRENCH_ENCRYPTION_KEY` as environment secrets. No persistent disk is used.
+6. Deploy, open the Render URL, create your account, sign in, and add your own Groq key under **Settings**. Set the Render URL as the Supabase Auth site's URL if email confirmation or redirects require it.
 
-The service binds to Render's `PORT`, accepts only the configured Render hostname, and uses `MR_TRENCH_DATA_DIR` on the attached disk. For a different host, set `MR_TRENCH_MODE=hosted`, `MR_TRENCH_DATA_DIR` to durable storage, `MR_TRENCH_ALLOWED_HOSTS` to the exact public hostname, plus the three secrets above. Keep TLS enabled at the host. Render's filesystem is ephemeral unless a persistent disk is attached; see [Render web services](https://render.com/docs/web-services) and [persistent disks](https://render.com/docs/disks). Supabase Auth is the identity provider; its database Row Level Security is not used because account cognition data is isolated in separate per-account database files. See [Supabase Auth](https://supabase.com/docs/guides/auth).
-
-Groq keys remain server-side and are encrypted at rest with the deployment's Fernet key. The encryption key is the root of trust for all saved user keys, so restrict access to it and back it up securely. See [Groq's security guidance](https://console.groq.com/docs/production-readiness/security-onboarding).
+The Render service binds to its assigned port and accepts the configured Render hostname. The Supabase table uses RLS so a signed-in account can access only its own state. The memory database is stored as an encoded SQLite file in that row; memory content is not separately encrypted by the app, while saved provider keys are Fernet-encrypted. For future growth, replace this prototype storage format with normalized Postgres tables and add request limits, monitoring, backups, and a durable background job service.
 The terminal interfaces below are still available if preferred.
 
 In PowerShell, set your Groq key in the current window and start the chat:

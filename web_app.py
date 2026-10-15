@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import http.cookies
+import tempfile
 import threading
 import time
 import urllib.error
@@ -36,6 +37,9 @@ local_settings: dict[str, object] = {
 }
 tenant_locks: dict[str, threading.RLock] = {}
 tenant_locks_guard = threading.Lock()
+hosted_memories: dict[str, ThoughtMemory] = {}
+active_tenant_tokens: dict[str, str] = {}
+hosted_settings: dict[str, dict[str, object]] = {}
 
 
 def _lock_for(user_id: str) -> threading.RLock:
@@ -43,12 +47,42 @@ def _lock_for(user_id: str) -> threading.RLock:
         return tenant_locks.setdefault(user_id, threading.RLock())
 
 
-def _settings_for(user_id: str | None) -> dict[str, object]:
-    return local_settings if user_id is None else multiuser.load_settings(user_id)
+def _settings_for(user_id: str | None, access_token: str = "") -> dict[str, object]:
+    if user_id is None:
+        return local_settings
+    with settings_lock:
+        if user_id not in hosted_settings:
+            hosted_settings[user_id] = multiuser.load_settings(user_id, access_token)
+        return hosted_settings[user_id]
 
 
-def _memory_for(user_id: str | None) -> ThoughtMemory:
-    return memory if user_id is None else ThoughtMemory(multiuser.tenant_database(user_id))
+def _save_settings(user_id: str, access_token: str, user_settings: dict[str, object]) -> None:
+    multiuser.save_settings(user_id, access_token, user_settings)
+    with settings_lock:
+        hosted_settings[user_id] = user_settings
+
+
+def _memory_for(user_id: str | None, access_token: str = "") -> ThoughtMemory:
+    if user_id is None:
+        return memory
+    with tenant_locks_guard:
+        store = hosted_memories.get(user_id)
+        if store is not None:
+            return store
+        database = Path(tempfile.gettempdir()) / f"mrtrench-{os.getpid()}-{user_id}.sqlite3"
+        saved = multiuser.load_memory_blob(user_id, access_token)
+        if saved:
+            database.write_bytes(saved)
+        store = ThoughtMemory(database)
+        hosted_memories[user_id] = store
+        return store
+
+
+def _persist_memory(user_id: str | None, access_token: str, store: ThoughtMemory) -> None:
+    if user_id is None:
+        return
+    database = Path(store.database)
+    multiuser.save_memory_blob(user_id, access_token, database.read_bytes())
 
 
 def _clean_base_url(value: object) -> str:
@@ -96,8 +130,8 @@ def _probe_provider(api_key: str, base_url: str, model: str) -> dict[str, object
     return {"ok": True, "message": f"Connection successful. The provider accepted the key and returned {len(ids)} available model(s)."}
 
 
-def _snapshot(user_id: str | None = None) -> dict[str, object]:
-    store, user_settings = _memory_for(user_id), _settings_for(user_id)
+def _snapshot(user_id: str | None = None, access_token: str = "") -> dict[str, object]:
+    store, user_settings = _memory_for(user_id, access_token), _settings_for(user_id, access_token)
     lock = state_lock if user_id is None else _lock_for(user_id)
     with lock, settings_lock:
         return {
@@ -122,11 +156,15 @@ def _snapshot(user_id: str | None = None) -> dict[str, object]:
 
 def _background_loop() -> None:
     while True:
-        time.sleep(2)
-        tenants = [None] if not multiuser.HOSTED_MODE else multiuser.registered_tenants()
-        for user_id in tenants:
+        time.sleep(5)
+        if multiuser.HOSTED_MODE:
+            with settings_lock:
+                tenants = list(active_tenant_tokens.items())
+        else:
+            tenants = [(None, "")]
+        for user_id, access_token in tenants:
             try:
-                user_settings = _settings_for(user_id)
+                user_settings = _settings_for(user_id, access_token)
                 if not (user_settings["worker_enabled"] and user_settings["api_key"]):
                     continue
                 interval = int(user_settings["interval_seconds"])
@@ -137,11 +175,14 @@ def _background_loop() -> None:
                 retry_map.setdefault(str(user_id), 0.0)
                 if now < retry_map[str(user_id)]:
                     continue
-                store = _memory_for(user_id)
+                store = _memory_for(user_id, access_token)
                 lock = state_lock if user_id is None else _lock_for(user_id)
                 with lock:
-                    process_due_triggers(store, model=str(user_settings["model"]),
-                                         api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
+                    processed = process_due_triggers(
+                        store, model=str(user_settings["model"]),
+                        api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
+                    if processed:
+                        _persist_memory(user_id, access_token, store)
                     if now >= next_review[str(user_id)]:
                         run_cycle(store, model=str(user_settings["model"]),
                                   api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
@@ -149,7 +190,8 @@ def _background_loop() -> None:
                         user_settings["last_cycle_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                         user_settings["last_worker_error"] = ""
                         if user_id is not None:
-                            multiuser.save_settings(user_id, user_settings)
+                            _save_settings(user_id, access_token, user_settings)
+                            _persist_memory(user_id, access_token, store)
                         with settings_lock:
                             local_settings["last_cycle_at"] = user_settings["last_cycle_at"]
                 setattr(_background_loop, "next_review", next_review)
@@ -157,9 +199,9 @@ def _background_loop() -> None:
             except Exception as exc:  # keep the UI alive when a provider is unavailable
                 if user_id is not None:
                     try:
-                        user_settings = _settings_for(user_id)
+                        user_settings = _settings_for(user_id, access_token)
                         user_settings["last_worker_error"] = str(exc)[:1000]
-                        multiuser.save_settings(user_id, user_settings)
+                        _save_settings(user_id, access_token, user_settings)
                     except Exception:
                         pass
                 with settings_lock:
@@ -238,7 +280,11 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
         token = self._cookie("mrtrench_session")
         user = multiuser.user_for_token(token)
         if user:
-            return str(user["id"]).lower(), user
+            user_id = str(user["id"]).lower()
+            self._access_token = token
+            with settings_lock:
+                active_tenant_tokens[user_id] = token
+            return user_id, user
         refresh_token = self._cookie("mrtrench_refresh")
         if refresh_token:
             try:
@@ -248,7 +294,11 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if user:
                     self._auth_cookie_headers = self._session_headers(
                         token, str(session.get("refresh_token", refresh_token)))
-                    return str(user["id"]).lower(), user
+                    user_id = str(user["id"]).lower()
+                    self._access_token = token
+                    with settings_lock:
+                        active_tenant_tokens[user_id] = token
+                    return user_id, user
             except ValueError:
                 pass
         return None, None
@@ -272,7 +322,8 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
         if self.path == "/api/state":
             try:
                 user_id, _ = self._require_user()
-                self._json(_snapshot(user_id), headers=getattr(self, "_auth_cookie_headers", {}))
+                self._json(_snapshot(user_id, getattr(self, "_access_token", "")),
+                           headers=getattr(self, "_auth_cookie_headers", {}))
             except PermissionError as exc:
                 self._json({"error": str(exc)}, 401)
             return
@@ -320,10 +371,16 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                            headers=self._session_headers(str(result["access_token"]), str(result["refresh_token"])))
                 return
             if self.path == "/api/auth/logout":
+                token = self._cookie("mrtrench_session")
+                user = multiuser.user_for_token(token) if multiuser.HOSTED_MODE else None
+                if user:
+                    with settings_lock:
+                        active_tenant_tokens.pop(str(user.get("id", "")).lower(), None)
                 self._json({"ok": True}, headers=self._session_headers(clear=True))
                 return
             user_id, _ = self._require_user()
-            store, user_settings = _memory_for(user_id), _settings_for(user_id)
+            access_token = getattr(self, "_access_token", "")
+            store, user_settings = _memory_for(user_id, access_token), _settings_for(user_id, access_token)
             lock = state_lock if user_id is None else _lock_for(user_id)
             if self.path == "/api/chat":
                 text = str(body.get("message", "")).strip()
@@ -336,6 +393,7 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                     raise ValueError("Add your API key in Settings before chatting.")
                 with lock:
                     reply = chat_turn(store, text, model=model, api_key=api_key, base_url=base_url)
+                    _persist_memory(user_id, access_token, store)
                 self._json({"reply": reply}, headers=getattr(self, "_auth_cookie_headers", {}))
             elif self.path == "/api/test-connection":
                 api_key = str(body.get("api_key", "")).strip() or str(user_settings["api_key"])
@@ -359,7 +417,7 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if user_id is None:
                     local_settings.update(user_settings)
                 else:
-                    multiuser.save_settings(user_id, user_settings)
+                    _save_settings(user_id, access_token, user_settings)
                 self._json({"ok": True})
             elif self.path == "/api/worker":
                 if not user_settings["api_key"]:
@@ -369,7 +427,7 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if user_id is None:
                     local_settings.update(user_settings)
                 else:
-                    multiuser.save_settings(user_id, user_settings)
+                    _save_settings(user_id, access_token, user_settings)
                 self._json({"ok": True})
             elif self.path == "/api/settings/forget-key":
                 user_settings["api_key"] = ""
@@ -378,7 +436,7 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if user_id is None:
                     local_settings.update(user_settings)
                 else:
-                    multiuser.save_settings(user_id, user_settings)
+                    _save_settings(user_id, access_token, user_settings)
                 self._json({"ok": True})
             elif self.path == "/api/review":
                 if not user_settings["api_key"]:
@@ -390,12 +448,14 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if user_id is None:
                     local_settings.update(user_settings)
                 else:
-                    multiuser.save_settings(user_id, user_settings)
+                    _save_settings(user_id, access_token, user_settings)
+                    _persist_memory(user_id, access_token, store)
                 self._json({"ok": True, "queued": bool(result.get("queued_message"))})
             elif self.path == "/api/pause":
                 paused = bool(body.get("paused", True))
                 with lock:
                     store.set_proactive_pause(paused, note="Changed from the web interface.")
+                    _persist_memory(user_id, access_token, store)
                 self._json({"ok": True})
             elif self.path == "/api/followups/cancel":
                 trigger_id = str(body.get("id", ""))
@@ -403,6 +463,7 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                     raise ValueError("Choose a follow-up to cancel.")
                 with lock:
                     store.cancel_trigger(trigger_id, note="Cancelled from the web interface.")
+                    _persist_memory(user_id, access_token, store)
                 self._json({"ok": True})
             else:
                 self._json({"error": "Not found."}, 404)
