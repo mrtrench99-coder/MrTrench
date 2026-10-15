@@ -22,6 +22,24 @@ This is an early research prototype for experimenting with stateful, cognition-i
 
 The default LLM endpoint is Groq's OpenAI-compatible API with `openai/gpt-oss-20b`. Hosted providers can impose rate limits; a rate-limited request may need to be retried after the wait period stated in the error.
 
+## Cognition-inspired design
+
+MrTrench is an application built around a hosted language model, not a newly trained model or a human brain simulation. The current design borrows software patterns from cognitive-agent research while keeping its claims modest:
+
+- **Working set and persistent memory:** chat and background review each retrieve a small cue-relevant set of thought threads and memories. Memory ranking combines lexical relevance, recency, importance, and confidence. This first version uses lightweight word matching, not embeddings or neural signals.
+- **Reactivation and reflection:** a new conversation cue can bring a suspended thread back into view. Background reflections must cite IDs of retrieved memories, and those evidence IDs are saved with the reflection. The background process is a scheduled model call, not continuous awareness.
+- **Temporary affect cue:** the chat model can record a tentative affect label for up to eight hours. Neutral or low-confidence interpretations clear it. It is included only to help the next reply choose a considerate tone; it is not a diagnosis, stable personality profile, or reason by itself to initiate contact.
+- **Separate attention and action gates:** the model can propose an unsolicited message, but application rules still enforce the user's pause, relevance and novelty thresholds, cooldown, and daily limit. Explicit reminders remain separate from discretionary check-ins.
+- **Human-centered voice:** MrTrench aims to be warm, specific, honest, and useful. It must not claim human feelings or consciousness, manufacture a private life, flatter to retain attention, or pressure someone into continuing. The goal is trust and helpfulness, not emotional dependence.
+
+These choices are informed by [Generative Agents](https://arxiv.org/abs/2304.03442), which combines a memory stream, retrieval, reflection, and planning, and [MemGPT](https://arxiv.org/abs/2310.08560), which treats a limited working context and external memory as separate resources. The relevance/recency/importance blend and evidence-linked reflection are adapted as engineering ideas, not copied as a claim about how human memory works. Research on large-scale brain networks describes interacting systems for salience, internally directed cognition, and executive control ([Menon, 2011](https://pubmed.ncbi.nlm.nih.gov/21908230/)); neural rhythms coordinate activity across time, but their computational roles remain an active research question ([Wang, 2010](https://pmc.ncbi.nlm.nih.gov/articles/PMC2923921/)). These findings motivate separating cue selection, background reflection, and outward action in software. They do not justify labeling software components as brain networks or treating their outputs as neural signals.
+
+Emotion support follows a similarly cautious approach: notice what the user actually says, acknowledge it, and let them choose between listening, practical help, or a change of subject. This is consistent with process-based accounts of emotion regulation, which distinguish attention, interpretation, and response ([Gross, 1998](https://journals.sagepub.com/doi/abs/10.1037/1089-2680.2.3.271)). The cue can be wrong, and users can correct or clear it by saying how they feel now.
+
+### Current research limits
+
+The memory retriever is lexical and can miss paraphrases; importance and affect are model estimates; a hosted model may still make mistakes; and a scheduled background cycle can only use information saved in this database. The inspiration is cognitive architecture research, not evidence that MrTrench has subjective experience. Proactive messages can feel intrusive or create unhealthy attachment, so silence, user controls, low message limits, transparent timing, and no engagement-maximizing objective are core behavior requirements.
+
 ## Start a conversation
 
 In PowerShell, set your Groq key in the current window and start the chat:

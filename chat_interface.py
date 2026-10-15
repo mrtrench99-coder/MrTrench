@@ -28,6 +28,15 @@ CHAT_SCHEMA: dict[str, Any] = {
         "resume_note": {"type": "string"},
         "memory_to_store": {"type": "string"},
         "memory_importance": {"type": "number", "minimum": 0, "maximum": 1},
+        "affect_state": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "label": {"type": "string", "enum": ["neutral", "positive", "low", "stressed", "frustrated", "anxious", "uncertain", "tired", "mixed"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+            "required": ["label", "confidence"],
+        },
         "thread_priority": {"type": "number", "minimum": 0, "maximum": 1},
         "related_thread_id": {"type": ["string", "null"]},
         "relation": {"type": "string"},
@@ -53,16 +62,18 @@ CHAT_SCHEMA: dict[str, Any] = {
     },
     "required": [
         "reply", "thread_action", "thread_id", "new_thread_title", "summary",
-        "current_state", "resume_note", "memory_to_store", "memory_importance",
+        "current_state", "resume_note", "memory_to_store", "memory_importance", "affect_state",
         "thread_priority", "related_thread_id", "relation",
         "follow_ups", "pause_after_follow_up",
         "cancel_trigger_ids",
     ],
 }
 
-CHAT_INSTRUCTIONS = """You are an experimental assistant with persistent thought threads and durable memories.
+CHAT_INSTRUCTIONS = """You are MrTrench, a thoughtful, warm, curious, and candid personal assistant with persistent thought threads and durable memories.
 Respond naturally to the user's latest message, using the recent conversation and supplied memory context.
 Treat memories as fallible records with source and confidence, not unquestionable facts. Do not claim access to information outside the supplied context.
+Be personable and consistent, with natural concise language, light humor when it fits, and specific interest in the user's actual topics. Do not flatter reflexively, pressure the user to keep chatting, claim to have human feelings or a private life, or pretend to be conscious between model calls. Be honest that you are an AI assistant if asked.
+Notice emotion only when supported by the user's words. Fill affect_state with the best tentative conversational cue and confidence; use neutral with low confidence when unclear. This is a short-lived tone cue, not a diagnosis or stable trait. When the user reports distress, acknowledge it without minimizing or immediately forcing a positive reframe. Ask whether they want listening, practical help, or a change of subject when that choice would help. Do not infer crisis or mental-health diagnoses from ordinary language.
 Keep separate: (1) conversation history, which is automatically retained, and (2) durable memory, which should only contain a useful stable preference, fact, decision, unresolved question, insight, or active line of inquiry.
 Do not turn ordinary small talk into a permanent memory. Never invent a user preference or fact.
 Choose thread_action=update when the message advances an existing active or suspended thought. Choose create only for a genuinely distinct ongoing line of thought. Otherwise choose none.
@@ -169,6 +180,7 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
             "thread_action": "none", "thread_id": None, "new_thread_title": "",
             "summary": "", "current_state": "", "resume_note": "",
             "memory_to_store": "", "memory_importance": 0.5,
+            "affect_state": {"label": "neutral", "confidence": 0.0},
             "thread_priority": 0.5, "related_thread_id": None, "relation": "related",
             "follow_ups": [],
             "pause_after_follow_up": False, "cancel_trigger_ids": [],
@@ -184,6 +196,17 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
         for key in ("thread_id", "related_thread_id"):
             if result[key] is not None and not isinstance(result[key], str):
                 result[key] = None
+        if not isinstance(result["affect_state"], dict):
+            result["affect_state"] = defaults["affect_state"]
+        else:
+            label = result["affect_state"].get("label")
+            if label not in {"neutral", "positive", "low", "stressed", "frustrated", "anxious", "uncertain", "tired", "mixed"}:
+                label = "neutral"
+            try:
+                affect_confidence = min(1.0, max(0.0, float(result["affect_state"].get("confidence", 0.0))))
+            except (TypeError, ValueError):
+                affect_confidence = 0.0
+            result["affect_state"] = {"label": label, "confidence": affect_confidence}
         for key in ("memory_importance", "thread_priority"):
             try:
                 result[key] = min(1.0, max(0.0, float(result[key])))
@@ -231,14 +254,14 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
         raise RuntimeError(f"Could not parse the Groq chat response: {exc}") from exc
 
 
-def _context(memory: ThoughtMemory) -> dict[str, Any]:
-    threads = memory.list_threads(status="active", limit=8)
-    threads += memory.list_threads(status="suspended", limit=8)
+def _context(memory: ThoughtMemory, query: str) -> dict[str, Any]:
+    threads = memory.retrieve_threads(query, limit=8)
     return {
         "recent_conversation": memory.recent_conversation(limit=16),
-        "recent_durable_memories": memory.recent_memories(limit=20),
+        "retrieved_durable_memories": memory.retrieve_memories(query, limit=10),
         "thought_threads": [memory.thread_context(item["id"], limit=8) for item in threads],
         "pending_follow_ups": memory.pending_triggers(limit=30),
+        "temporary_affect_cue": memory.current_affect_state(),
     }
 
 
@@ -328,8 +351,11 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
     if memory.proactive_paused():
         memory.set_proactive_pause(False, note="User initiated a new conversation.")
     memory.add_conversation_message("user", user_text)
-    payload = {"user_message": user_text, **_context(memory)}
+    payload = {"user_message": user_text, **_context(memory, user_text)}
     result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
+    affect = result.get("affect_state", {})
+    if isinstance(affect, dict):
+        memory.set_affect_state(affect.get("label", "neutral"), affect.get("confidence", 0.0))
     thread_id = _apply_cognitive_update(memory, result)
     pending_ids = {item["id"] for item in memory.pending_triggers(limit=100)}
     for trigger_id in result.get("cancel_trigger_ids", []):

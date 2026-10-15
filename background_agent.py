@@ -37,25 +37,26 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "relation": {"type": "string"},
         "relevance": {"type": "number", "minimum": 0, "maximum": 1},
         "novelty": {"type": "number", "minimum": 0, "maximum": 1},
+        "memory_evidence_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
     },
     "required": [
         "action", "thread_id", "new_thread_title", "reflection", "message",
         "updated_summary", "current_state", "resume_note", "memory_to_store",
-        "related_thread_id", "relation", "relevance", "novelty",
+        "related_thread_id", "relation", "relevance", "novelty", "memory_evidence_ids",
     ],
 }
 
-INSTRUCTIONS = """You are the attention process for an experimental assistant with persistent thought threads.
-Review the supplied threads, durable memories, recent conversation, recent events, and recent initiated messages.
-Find a real connection, unresolved question, or useful observation only when supported by this context.
-You are not continuously conscious: this is one discrete review cycle. Do not claim otherwise.
-Choose quiet unless there is a specific, novel, useful reason to start a conversation.
-Do not send greetings just to fill silence. Do not repeat a recent initiated message.
-Never invent facts, claim to have observed external events, or imply an action was taken outside this process.
-If useful, update a thread's compact summary/state or save a durable memory even when staying quiet.
-Set thread_id to an existing thread id when one is relevant; use null and provide new_thread_title only for a genuinely new line of thought.
-When action is speak, write one concise, natural message that begins the conversation and explains the connection.
-When action is quiet, message must be empty. Provide JSON matching the requested schema."""
+INSTRUCTIONS = """You are MrTrench's discrete background attention and reflection process.
+Review the active working set, cue-retrieved memories, recent conversation, events, and initiated messages.
+Look for a supported unresolved thought or meaningful connection, and prefer quiet if nothing useful is present.
+This is one scheduled computation, not continuous consciousness. Never claim private experiences, human feelings, or external observation.
+Be warm, curious, and candid; do not flatter reflexively, pressure the user to continue, or optimize for engagement.
+Treat any affect cue as uncertain and temporary. It may inform gentle wording, but mood alone is not a reason to contact the user.
+Do not send greetings just to fill silence or repeat a recent initiated message. Never invent facts or imply external actions.
+If saving a reflection, cite one or more supplied memory IDs in memory_evidence_ids; only infer what those memories and supplied conversation support.
+If useful, update a thread's compact summary/state even when staying quiet. Use an existing thread id when relevant; create a new thread only for a genuinely distinct ongoing thought.
+When action is speak, write one concise, natural message that explains the useful connection. When quiet, message must be empty.
+Provide JSON matching the requested schema."""
 
 
 def ask_model(payload: dict[str, Any], *, model: str, api_key: str,
@@ -150,15 +151,22 @@ def _allowed_to_speak(memory: ThoughtMemory, proposal: dict[str, Any], *,
 def run_cycle(memory: ThoughtMemory, *, model: str, api_key: str,
               cooldown_minutes: int = 60, daily_limit: int = 6,
               base_url: str = GROQ_BASE_URL) -> dict[str, Any]:
-    threads = memory.list_threads(status="active", limit=20)
-    threads += memory.list_threads(status="suspended", limit=20)
+    recent_conversation = memory.recent_conversation(limit=12)
+    cue = " ".join(
+        str(item.get("content", ""))
+        for item in recent_conversation
+        if item.get("role") == "user"
+    )[-2400:]
+    threads = memory.retrieve_threads(cue, limit=8)
+    retrieved_memories = memory.retrieve_memories(cue, limit=10)
     payload = {
         "cycle_time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "threads": [memory.thread_context(thread["id"]) for thread in threads],
-        "recent_durable_memories": memory.recent_memories(limit=20),
-        "recent_conversation": memory.recent_conversation(limit=16),
-        "recent_events": memory.recent_events(limit=30),
-        "recent_initiated_messages": memory.recent_messages(limit=20),
+        "working_set_threads": [memory.thread_context(thread["id"]) for thread in threads],
+        "retrieved_durable_memories": retrieved_memories,
+        "recent_conversation": recent_conversation,
+        "recent_events": memory.recent_events(limit=15),
+        "recent_initiated_messages": memory.recent_messages(limit=10),
+        "temporary_affect_cue": memory.current_affect_state(),
     }
     proposal = ask_model(payload, model=model, api_key=api_key, base_url=base_url)
 
@@ -190,7 +198,9 @@ def run_cycle(memory: ThoughtMemory, *, model: str, api_key: str,
                 strength=min(1.0, max(0.0, proposal.get("relevance", 0.5))),
             )
 
-    if proposal.get("memory_to_store", "").strip():
+    retrieved_ids = {item["id"] for item in retrieved_memories}
+    evidence_ids = sorted(set(proposal.get("memory_evidence_ids", [])) & retrieved_ids)
+    if proposal.get("memory_to_store", "").strip() and evidence_ids:
         memory.add_memory(
             proposal["memory_to_store"].strip(),
             kind="reflection",
@@ -198,6 +208,7 @@ def run_cycle(memory: ThoughtMemory, *, model: str, api_key: str,
             confidence=min(1.0, max(0.0, proposal.get("relevance", 0.5))),
             importance=min(1.0, max(0.0, proposal.get("novelty", 0.5))),
             thread_id=thread_id,
+            metadata={"evidence_memory_ids": evidence_ids},
         )
 
     should_speak, blocked_reason = _allowed_to_speak(
@@ -263,7 +274,10 @@ def process_due_triggers(memory: ThoughtMemory, *, model: str, api_key: str,
                     "content": json.dumps({
                         "due_follow_up": trigger,
                         "recent_conversation": memory.recent_conversation(limit=20),
-                        "recent_memories": memory.recent_memories(limit=12),
+                        "relevant_memories": memory.retrieve_memories(
+                            f"{trigger.get('title', '')} {trigger.get('context', '')}", limit=8
+                        ),
+                        "temporary_affect_cue": memory.current_affect_state(),
                     }, ensure_ascii=False),
                 },
             ],

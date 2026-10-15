@@ -8,10 +8,12 @@ to decide what to reactivate when new context arrives.
 from __future__ import annotations
 
 import json
+import math
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -22,6 +24,19 @@ def _now() -> str:
 
 def _id() -> str:
     return str(uuid.uuid4())
+
+
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+    "so", "that", "the", "their", "them", "there", "this", "to", "was", "we",
+    "what", "when", "where", "which", "who", "why", "will", "with", "you", "your",
+}
+
+
+def _tokens(text: str) -> set[str]:
+    return {word for word in re.findall(r"[\w']+", text.casefold())
+            if len(word) > 1 and word not in _STOP_WORDS}
 
 
 class ThoughtMemory:
@@ -68,7 +83,8 @@ class ThoughtMemory:
                     confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0 AND confidence <= 1),
                     importance REAL NOT NULL DEFAULT 0.5 CHECK (importance >= 0 AND importance <= 1),
                     metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    last_accessed_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS thought_memory_links (
@@ -136,6 +152,14 @@ class ThoughtMemory:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS affect_state (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    label TEXT NOT NULL,
+                    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_threads_status_priority
                     ON thought_threads(status, priority DESC, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memory_content ON memories(content);
@@ -161,6 +185,9 @@ class ThoughtMemory:
                 db.execute(
                     "ALTER TABLE cognitive_triggers ADD COLUMN purpose TEXT NOT NULL DEFAULT ''"
                 )
+            memory_columns = {row["name"] for row in db.execute("PRAGMA table_info(memories)")}
+            if "last_accessed_at" not in memory_columns:
+                db.execute("ALTER TABLE memories ADD COLUMN last_accessed_at TEXT")
 
     @staticmethod
     def _record(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -247,7 +274,10 @@ class ThoughtMemory:
         memory_id, now = _id(), _now()
         with self._connection() as db:
             db.execute(
-                "INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """INSERT INTO memories
+                   (id, content, kind, source, confidence, importance, metadata_json,
+                    created_at, last_accessed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
                 (memory_id, content, kind, source, confidence, importance,
                  json.dumps(metadata or {}), now),
             )
@@ -302,6 +332,30 @@ class ThoughtMemory:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def retrieve_threads(self, query: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        """Select a small working set of active/suspended thoughts for this cue."""
+        query_tokens = _tokens(query)
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM thought_threads WHERE status IN ('active', 'suspended')"
+            ).fetchall()
+        now = datetime.now(timezone.utc)
+        scored = []
+        for row in rows:
+            item = dict(row)
+            text_tokens = _tokens(" ".join((item["title"], item["summary"],
+                                                item["current_state"], item["resume_note"])))
+            relevance = (len(query_tokens & text_tokens) / len(query_tokens)) if query_tokens else 0.0
+            updated = datetime.fromisoformat(item["updated_at"])
+            age_days = max(0.0, (now - updated.astimezone(timezone.utc)).total_seconds() / 86400)
+            recency = math.exp(-age_days / 30.0)
+            score = 0.55 * relevance + 0.25 * float(item["priority"]) + 0.20 * recency
+            item["attention_score"] = round(score, 4)
+            item["cue_relevance"] = round(relevance, 4)
+            scored.append(item)
+        scored.sort(key=lambda item: (item["attention_score"], item["updated_at"]), reverse=True)
+        return scored[:max(0, limit)]
+
     def thread_context(self, thread_id: str, *, limit: int = 20) -> dict[str, Any]:
         """Fetch a thread's attached memories and neighboring thought threads."""
         with self._connection() as db:
@@ -338,6 +392,87 @@ class ThoughtMemory:
         for record in records:
             record["metadata"] = json.loads(record.pop("metadata_json"))
         return records
+
+    def retrieve_memories(self, query: str, *, limit: int = 8,
+                          candidate_limit: int | None = None) -> list[dict[str, Any]]:
+        """Rank memories by cue relevance, recency, importance, and confidence.
+
+        This is a lightweight lexical retriever, not semantic embedding search.
+        Access time is updated for selected memories to model attentional reactivation.
+        """
+        with self._connection() as db:
+            if candidate_limit is None:
+                rows = db.execute("SELECT * FROM memories ORDER BY created_at DESC").fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?",
+                    (max(0, candidate_limit),),
+                ).fetchall()
+        if not rows or limit <= 0:
+            return []
+        query_tokens = _tokens(query)
+        documents = [(dict(row), _tokens(row["content"])) for row in rows]
+        frequencies: dict[str, int] = {}
+        for _, words in documents:
+            for word in words:
+                frequencies[word] = frequencies.get(word, 0) + 1
+        idf = {word: math.log(1.0 + len(documents) / (1.0 + frequencies.get(word, 0)))
+               for word in query_tokens}
+        denominator = sum(idf.values())
+        now = datetime.now(timezone.utc)
+        ranked = []
+        for item, words in documents:
+            relevance = (sum(idf[word] for word in query_tokens & words) / denominator
+                         if denominator else 0.0)
+            accessed_at = item.get("last_accessed_at") or item["created_at"]
+            accessed = datetime.fromisoformat(accessed_at).astimezone(timezone.utc)
+            age_days = max(0.0, (now - accessed).total_seconds() / 86400)
+            recency = math.exp(-age_days / 14.0)
+            importance = min(1.0, max(0.0, float(item["importance"])))
+            confidence = min(1.0, max(0.0, float(item["confidence"])))
+            score = 0.50 * relevance + 0.25 * recency + 0.15 * importance + 0.10 * confidence
+            item["retrieval_score"] = round(score, 4)
+            item["cue_relevance"] = round(relevance, 4)
+            item["recency_score"] = round(recency, 4)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            ranked.append(item)
+        ranked.sort(key=lambda item: (item["retrieval_score"], item["created_at"]), reverse=True)
+        selected = ranked[:limit]
+        if selected and query_tokens:
+            accessed_at = _now()
+            with self._connection() as db:
+                db.executemany(
+                    "UPDATE memories SET last_accessed_at = ? WHERE id = ?",
+                    [(accessed_at, item["id"]) for item in selected],
+                )
+        return selected
+
+    def set_affect_state(self, label: str, confidence: float, *, ttl_hours: int = 8) -> None:
+        """Store a temporary, uncertain conversational affect cue, never a diagnosis."""
+        allowed = {"neutral", "positive", "low", "stressed", "frustrated", "anxious", "uncertain", "tired", "mixed"}
+        if label not in allowed:
+            return
+        confidence = min(1.0, max(0.0, float(confidence)))
+        now = datetime.now(timezone.utc)
+        with self._connection() as db:
+            if label == "neutral" or confidence < 0.65:
+                db.execute("DELETE FROM affect_state WHERE singleton = 1")
+                return
+            db.execute(
+                """INSERT OR REPLACE INTO affect_state
+                   (singleton, label, confidence, updated_at, expires_at)
+                   VALUES (1, ?, ?, ?, ?)""",
+                (label, confidence, now.isoformat(timespec="seconds"),
+                 (now + timedelta(hours=max(1, ttl_hours))).isoformat(timespec="seconds")),
+            )
+
+    def current_affect_state(self) -> dict[str, Any] | None:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM affect_state WHERE singleton = 1 AND expires_at > ?",
+                (_now(),),
+            ).fetchone()
+        return self._record(row)
 
     def recent_memories(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Return recent durable memories, regardless of thread attachment."""
