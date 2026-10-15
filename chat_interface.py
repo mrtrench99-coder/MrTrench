@@ -7,6 +7,7 @@ import json
 import os
 import random
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import urllib.error
 import urllib.request
 from typing import Any
@@ -78,7 +79,7 @@ Keep separate: (1) conversation history, which is automatically retained, and (2
 Do not turn ordinary small talk into a permanent memory. Never invent a user preference or fact.
 Choose thread_action=update when the message advances an existing active or suspended thought. Choose create only for a genuinely distinct ongoing line of thought. Otherwise choose none.
 If resuming a suspended thread, state why in resume_note. If a durable memory is warranted, write a concise, source-faithful memory_to_store; otherwise leave it empty.
-Treat meaningful plans, unresolved decisions, upcoming events, ongoing problems, and user-chosen commitments as persistent thought threads. If there is a clear reason to revisit one, schedule one gentle follow-up. For explicit reminder requests, create one separate item in follow_ups for EACH distinct task, preserving each task's title and time independently. A message can contain multiple reminders; never drop, merge, or overwrite one with another. Use category=explicit, kind=reminder, and either an exact delay_minutes or a local ISO due_at. For meaningful plans, decisions, events, problems, or commitments, use category plan/decision/event/problem/commitment and kind=check_in; use a stated timing, or a reasonable delay of 1–3 days for an active concern with no timing. For a low-mood disclosure, use category=mood and kind=check_in; the application chooses 5–30 minutes randomly. Positive moods and casual mentions do not get check-ins. Never schedule more than 10 items in one response, and never invent an event date or user commitment. If the user asks you to stop contacting them after a follow-up, set pause_after_follow_up=true; explicit reminders must still run. If the user cancels a pending trigger, include its id in cancel_trigger_ids. Do not repeatedly schedule the same concern.
+Treat meaningful plans, unresolved decisions, upcoming events, ongoing problems, and user-chosen commitments as persistent thought threads. If there is a clear reason to revisit one, schedule one gentle follow-up. For explicit reminder requests, create one separate item in follow_ups for EACH distinct task, preserving each task's title and time independently. A message can contain multiple reminders; never drop, merge, or overwrite one with another. For relative times like “in 2 minutes,” use delay_minutes with the exact number of minutes and leave due_at empty. For absolute clock times, use due_at in the supplied user timezone with its UTC offset; do not use Z or UTC. Use category=explicit and kind=reminder. For meaningful plans, decisions, events, problems, or commitments, use category plan/decision/event/problem/commitment and kind=check_in; use a stated timing, or a reasonable delay of 1–3 days for an active concern with no timing. For a low-mood disclosure, use category=mood and kind=check_in; the application chooses 5–30 minutes randomly. Positive moods and casual mentions do not get check-ins. Never schedule more than 10 items in one response, and never invent an event date or user commitment. If the user asks you to stop contacting them after a follow-up, set pause_after_follow_up=true; explicit reminders must still run. If the user cancels a pending trigger, include its id in cancel_trigger_ids. Do not repeatedly schedule the same concern.
 The reply should answer the user directly. Return JSON matching the required schema."""
 
 
@@ -254,9 +255,15 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
         raise RuntimeError(f"Could not parse the Groq chat response: {exc}") from exc
 
 
-def _context(memory: ThoughtMemory, query: str) -> dict[str, Any]:
+def _context(memory: ThoughtMemory, query: str, user_timezone: str | None = None) -> dict[str, Any]:
     threads = memory.retrieve_threads(query, limit=8)
+    try:
+        tz = ZoneInfo(user_timezone) if user_timezone else datetime.now().astimezone().tzinfo
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = datetime.now().astimezone().tzinfo
     return {
+        "user_local_time": datetime.now(tz).isoformat(timespec="seconds"),
+        "user_timezone": getattr(tz, "key", None) or str(tz),
         "recent_conversation": memory.recent_conversation(limit=16),
         "retrieved_durable_memories": memory.retrieve_memories(query, limit=10),
         "thought_threads": [memory.thread_context(item["id"], limit=8) for item in threads],
@@ -311,7 +318,8 @@ def _apply_cognitive_update(memory: ThoughtMemory, result: dict[str, Any]) -> st
 
 
 def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
-                        thread_id: str | None, pause_after_follow_up: bool = False) -> dict[str, Any] | None:
+                        thread_id: str | None, pause_after_follow_up: bool = False,
+                        user_timezone: str | None = None) -> dict[str, Any] | None:
     kind = result.get("kind", "none")
     if kind not in {"reminder", "check_in"}:
         return None
@@ -327,7 +335,11 @@ def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
                 return pending
     delay = random.randint(5, 30) if category == "mood" else result.get("delay_minutes", 0)
     due_value = result.get("due_at", "").strip()
-    now_local = datetime.now().astimezone()
+    try:
+        tz = ZoneInfo(user_timezone) if user_timezone else datetime.now().astimezone().tzinfo
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = datetime.now().astimezone().tzinfo
+    now_local = datetime.now(tz)
     if delay > 0:
         due = now_local + timedelta(minutes=delay)
     elif due_value:
@@ -347,11 +359,11 @@ def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
 
 
 def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
-              api_key: str, base_url: str) -> str:
+              api_key: str, base_url: str, user_timezone: str | None = None) -> str:
     if memory.proactive_paused():
         memory.set_proactive_pause(False, note="User initiated a new conversation.")
     memory.add_conversation_message("user", user_text)
-    payload = {"user_message": user_text, **_context(memory, user_text)}
+    payload = {"user_message": user_text, **_context(memory, user_text, user_timezone)}
     result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
     affect = result.get("affect_state", {})
     if isinstance(affect, dict):
@@ -367,6 +379,7 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
         trigger = _schedule_follow_up(
             memory, item, thread_id=thread_id,
             pause_after_follow_up=result.get("pause_after_follow_up", False),
+            user_timezone=user_timezone,
         )
         if trigger is None:
             failed.append(item)

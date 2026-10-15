@@ -398,7 +398,9 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 if not api_key:
                     raise ValueError("Add your API key in Settings before chatting.")
                 with lock:
-                    reply = chat_turn(store, text, model=model, api_key=api_key, base_url=base_url)
+                    timezone_name = str(body.get("time_zone", "")).strip() or None
+                    reply = chat_turn(store, text, model=model, api_key=api_key,
+                                      base_url=base_url, user_timezone=timezone_name)
                     _persist_memory(user_id, access_token, store)
                 self._json({"reply": reply}, headers=getattr(self, "_auth_cookie_headers", {}))
             elif self.path == "/api/test-connection":
