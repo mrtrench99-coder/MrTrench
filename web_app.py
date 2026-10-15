@@ -140,9 +140,19 @@ def _snapshot(user_id: str | None = None, access_token: str = "") -> dict[str, o
     store, user_settings = _memory_for(user_id, access_token), _settings_for(user_id, access_token)
     lock = state_lock if user_id is None else _lock_for(user_id)
     with lock, settings_lock:
+        messages = store.recent_conversation(limit=100)
+        proactive_messages = store.recent_messages(limit=30)
+        reactions = store.recent_reactions(
+            chat_ids=[item["id"] for item in messages],
+            proactive_ids=[item["id"] for item in proactive_messages],
+        )
+        for item in messages:
+            item["reaction"] = reactions.get(("chat", item["id"]))
+        for item in proactive_messages:
+            item["reaction"] = reactions.get(("proactive", item["id"]))
         return {
-            "messages": store.recent_conversation(limit=100),
-            "proactive_messages": store.recent_messages(limit=30),
+            "messages": messages,
+            "proactive_messages": proactive_messages,
             "threads": store.list_threads(status="active", limit=30)
             + store.list_threads(status="suspended", limit=30),
             "memories": store.recent_memories(limit=50),
@@ -473,6 +483,16 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                     raise ValueError("Choose a follow-up to cancel.")
                 with lock:
                     store.cancel_trigger(trigger_id, note="Cancelled from the web interface.")
+                    _persist_memory(user_id, access_token, store)
+                self._json({"ok": True})
+            elif self.path == "/api/reaction":
+                message_type = str(body.get("type", ""))
+                message_id = str(body.get("id", ""))
+                emoji = str(body.get("emoji", ""))
+                if emoji not in {"", "🙂", "❤️", "😂", "👏", "🤔", "👍"}:
+                    raise ValueError("Choose one of the available emoji reactions.")
+                with lock:
+                    store.set_message_reaction(message_type, message_id, emoji)
                     _persist_memory(user_id, access_token, store)
                 self._json({"ok": True})
             else:

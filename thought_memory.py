@@ -131,6 +131,14 @@ class ThoughtMemory:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS message_reactions (
+                    message_type TEXT NOT NULL CHECK (message_type IN ('chat', 'proactive')),
+                    message_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (message_type, message_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS cognitive_triggers (
                     id TEXT PRIMARY KEY,
                     kind TEXT NOT NULL CHECK (kind IN ('reminder', 'check_in')),
@@ -550,6 +558,40 @@ class ThoughtMemory:
         for record in records:
             record.pop("sequence", None)
         return records
+
+    def set_message_reaction(self, message_type: str, message_id: str, emoji: str | None,
+                             *, allowed_role: str = "assistant") -> None:
+        """Set or clear the single emoji reaction attached to a stored message."""
+        if message_type not in {"chat", "proactive"}:
+            raise ValueError("Unknown message type.")
+        table = "conversation_messages" if message_type == "chat" else "proactive_messages"
+        with self._connection() as db:
+            column = "role" if message_type == "chat" else "id"
+            row = db.execute(f"SELECT {column} FROM {table} WHERE id = ?", (message_id,)).fetchone()
+            if row is None:
+                raise ValueError("That message could not be found.")
+            if message_type == "chat" and row["role"] != allowed_role:
+                raise ValueError("That message cannot receive this reaction.")
+            if not emoji:
+                db.execute("DELETE FROM message_reactions WHERE message_type = ? AND message_id = ?",
+                           (message_type, message_id))
+            else:
+                db.execute(
+                    "INSERT INTO message_reactions VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(message_type, message_id) DO UPDATE SET emoji=excluded.emoji, created_at=excluded.created_at",
+                    (message_type, message_id, emoji, _now()),
+                )
+
+    def recent_reactions(self, *, chat_ids: list[str], proactive_ids: list[str]) -> dict[tuple[str, str], str]:
+        """Return reactions for the visible message ids."""
+        pairs = [("chat", item) for item in chat_ids] + [("proactive", item) for item in proactive_ids]
+        if not pairs:
+            return {}
+        with self._connection() as db:
+            rows = db.execute("SELECT message_type, message_id, emoji FROM message_reactions").fetchall()
+        wanted = set(pairs)
+        return {(row["message_type"], row["message_id"]): row["emoji"]
+                for row in rows if (row["message_type"], row["message_id"]) in wanted}
 
     def schedule_trigger(self, kind: str, title: str, due_at: str, *,
                          context: str = "", thread_id: str | None = None,

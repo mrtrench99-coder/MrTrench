@@ -21,6 +21,7 @@ CHAT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "reply": {"type": "string"},
+        "user_message_reaction": {"type": "string", "enum": ["", "🙂", "❤️", "😂", "👏", "🤔", "👍"]},
         "thread_action": {"type": "string", "enum": ["none", "create", "update"]},
         "thread_id": {"type": ["string", "null"]},
         "new_thread_title": {"type": "string"},
@@ -62,7 +63,7 @@ CHAT_SCHEMA: dict[str, Any] = {
         "cancel_trigger_ids": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "reply", "thread_action", "thread_id", "new_thread_title", "summary",
+        "reply", "user_message_reaction", "thread_action", "thread_id", "new_thread_title", "summary",
         "current_state", "resume_note", "memory_to_store", "memory_importance", "affect_state",
         "thread_priority", "related_thread_id", "relation",
         "follow_ups", "pause_after_follow_up",
@@ -81,6 +82,7 @@ Do not turn ordinary small talk into a permanent memory. Never invent a user pre
 Choose thread_action=update when the message advances an existing active or suspended thought. Choose create only for a genuinely distinct ongoing line of thought. Otherwise choose none.
 If resuming a suspended thread, state why in resume_note. If a durable memory is warranted, write a concise, source-faithful memory_to_store; otherwise leave it empty.
 Treat meaningful plans, unresolved decisions, upcoming events, ongoing problems, and user-chosen commitments as persistent thought threads. If there is a clear reason to revisit one, schedule one gentle follow-up. For explicit reminder requests, create one separate item in follow_ups for EACH distinct task, preserving each task's title and time independently. A message can contain multiple reminders; never drop, merge, or overwrite one with another. For relative times like “in 2 minutes,” use delay_minutes with the exact number of minutes and leave due_at empty. For absolute clock times, use due_at in the supplied user timezone with its UTC offset; do not use Z or UTC. Use category=explicit and kind=reminder. For meaningful plans, decisions, events, problems, or commitments, use category plan/decision/event/problem/commitment and kind=check_in; use a stated timing, or a reasonable delay of 1–3 days for an active concern with no timing. For low mood, reflect the emotion accurately in affect_state and let the application decide privately whether to check in later; do not create or announce a mood follow-up. Positive moods and casual mentions do not get check-ins. Never schedule more than 10 items in one response, and never invent an event date or user commitment. If the user asks you to stop contacting them after a follow-up, set pause_after_follow_up=true; explicit reminders must still run. If the user cancels a pending trigger, include its id in cancel_trigger_ids. Do not repeatedly schedule the same concern.
+React naturally to the user's latest message when an emoji would add warmth or acknowledge its tone; choose one fitting emoji from the allowed set, or an empty string when a reaction would feel forced. Do not use a reaction as a substitute for answering. The user_message_reaction field is your reaction to the user's message.
 The reply should answer the user directly. Return JSON matching the required schema."""
 
 
@@ -180,6 +182,7 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
     try:
         defaults: dict[str, Any] = {
             "thread_action": "none", "thread_id": None, "new_thread_title": "",
+            "user_message_reaction": "",
             "summary": "", "current_state": "", "resume_note": "",
             "memory_to_store": "", "memory_importance": 0.5,
             "affect_state": {"label": "neutral", "confidence": 0.0},
@@ -198,6 +201,8 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
         for key in ("thread_id", "related_thread_id"):
             if result[key] is not None and not isinstance(result[key], str):
                 result[key] = None
+        if result.get("user_message_reaction") not in {"", "🙂", "❤️", "😂", "👏", "🤔", "👍"}:
+            result["user_message_reaction"] = ""
         if not isinstance(result["affect_state"], dict):
             result["affect_state"] = defaults["affect_state"]
         else:
@@ -363,9 +368,12 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
               api_key: str, base_url: str, user_timezone: str | None = None) -> str:
     if memory.proactive_paused():
         memory.set_proactive_pause(False, note="User initiated a new conversation.")
-    memory.add_conversation_message("user", user_text)
+    user_message = memory.add_conversation_message("user", user_text)
     payload = {"user_message": user_text, **_context(memory, user_text, user_timezone)}
     result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
+    if result.get("user_message_reaction"):
+        memory.set_message_reaction("chat", user_message["id"], result["user_message_reaction"],
+                                    allowed_role="user")
     affect = result.get("affect_state", {})
     if isinstance(affect, dict):
         memory.set_affect_state(affect.get("label", "neutral"), affect.get("confidence", 0.0))
