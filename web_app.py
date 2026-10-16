@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from background_agent import DEFAULT_MODEL, GROQ_BASE_URL, process_due_triggers, run_cycle
-from chat_interface import chat_turn
+from chat_interface import chat_turn, greeting_reaction_follow_up
 from thought_memory import ThoughtMemory
 import multiuser
 
@@ -138,10 +138,6 @@ def _is_current_assistant_greeting(store: ThoughtMemory, message_id: str) -> boo
         r"^(?:good\s+(?:morning|afternoon|evening|night)|morning|afternoon|evening|hello|hi|hey)\b",
         content,
     ))
-
-
-def _greeting_reaction_follow_up() -> str:
-    return "A thumbs-up after my good morning? Scathing review. 😏 What’s going on, all good?"
 
 
 def _clean_base_url(value: object) -> str:
@@ -615,11 +611,19 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 follow_up = None
                 with lock:
                     store.set_message_reaction(message_type, message_id, emoji)
-                    if (emoji == "👍" and message_type == "chat"
-                            and _is_current_assistant_greeting(store, message_id)):
-                        follow_up = store.add_conversation_message(
-                            "assistant", _greeting_reaction_follow_up())
                     _persist_memory(user_id, access_token, store)
+                    if (emoji == "👍" and message_type == "chat"
+                            and _is_current_assistant_greeting(store, message_id)
+                            and user_settings.get("api_key")):
+                        reply = greeting_reaction_follow_up(
+                            store,
+                            model=str(user_settings["model"]),
+                            api_key=str(user_settings["api_key"]),
+                            base_url=str(user_settings["base_url"]),
+                        )
+                        if reply:
+                            follow_up = store.add_conversation_message("assistant", reply)
+                            _persist_memory(user_id, access_token, store)
                 self._json({"ok": True, "follow_up": follow_up is not None})
             else:
                 self._json({"error": "Not found."}, 404)

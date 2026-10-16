@@ -374,6 +374,25 @@ _HAPPY_SELF_REPORT = re.compile(
     re.IGNORECASE,
 )
 
+_DISTRESS_CUE = re.compile(
+    r"\b(?:frustrat\w*|disappoint\w*|angry|upset|unhappy|not happy|hurt|annoyed|not satisfied|"
+    r"not helpful|didn['’]?t help|couldn['’]?t help|not working|doesn['’]?t work|"
+    r"didn['’]?t work|still broken|still failing|useless|confusing|wrong answer)\b",
+    re.IGNORECASE,
+)
+_BOT_PROBLEM_CUE = re.compile(
+    r"\b(?:problem|issue|error|bug|code|model|api|setup|deploy|install|instructions|"
+    r"fix|debug|website|server|reminder|follow[- ]?up|project|build|broken|task|work)\b",
+    re.IGNORECASE,
+)
+_RECOVERY_CUE = re.compile(
+    r"\b(?:(?:that|it|this)\s+(?:worked|works|is working|fixed it)|solved|fixed now|"
+    r"working now|got it working|all good now|no worries|forgive you|"
+    r"not angry (?:anymore|now)|not upset (?:anymore|now)|i(?:['’]m| am) good now)\b"
+    r"|\bthanks?\b.{0,30}\b(?:worked|fixed|solved|helped)\b",
+    re.IGNORECASE,
+)
+
 
 def _local_happy_cue(user_text: str) -> bool:
     """Recognize only clear first-person reports of positive mood, without an LLM."""
@@ -395,6 +414,84 @@ def _reply_already_asks_about_happiness(reply: str) -> bool:
     return "?" in reply and any(
         term in lowered for term in ("happy", "good mood", "reason", "what made", "what put")
     )
+
+
+def _recent_unresolved_bot_distress(memory: ThoughtMemory) -> list[dict[str, Any]]:
+    """Find a recent, still-unresolved user distress cue tied to a help exchange."""
+    history = memory.recent_conversation(limit=40)[-24:]
+    pending: tuple[int, dict[str, Any]] | None = None
+    for index, message in enumerate(history):
+        if message.get("role") != "user":
+            continue
+        text = str(message.get("content", ""))
+        if _RECOVERY_CUE.search(text):
+            pending = None
+            continue
+        if not _DISTRESS_CUE.search(text):
+            continue
+        earlier = history[max(0, index - 5):index]
+        prior_text = " ".join(str(item.get("content", "")) for item in earlier)
+        task_context = bool(
+            _BOT_PROBLEM_CUE.search(f"{text} {prior_text}")
+            and any(item.get("role") == "assistant" for item in earlier)
+        )
+        direct_bot_cue = re.search(
+            r"\b(?:you|your|mrtrench|answer|response|suggestion|solution)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if not (task_context or direct_bot_cue):
+            continue
+        pending = (index, message)
+
+    if pending is None:
+        return []
+    index, _ = pending
+    created = str(history[index].get("created_at", ""))
+    try:
+        timestamp = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)) > timedelta(hours=24):
+            return []
+    except ValueError:
+        return []
+    # Keep the specific user concern and the assistant's next response for grounding.
+    return history[max(0, index - 1):min(len(history), index + 3)]
+
+
+def greeting_reaction_follow_up(memory: ThoughtMemory, *, model: str,
+                                api_key: str, base_url: str) -> str | None:
+    """Write a one-off, context-grounded repair check-in after a 👍 greeting reaction."""
+    distress_context = _recent_unresolved_bot_distress(memory)
+    if not distress_context:
+        return None
+    excerpt = "\n".join(
+        f"{item.get('role', 'unknown')}: {str(item.get('content', ''))[:1000]}"
+        for item in distress_context
+    )
+    query = " ".join(str(item.get("content", "")) for item in distress_context)
+    related_threads = memory.retrieve_threads(query, limit=3)
+    payload = {
+        "user_message": (
+            "The user reacted with 👍 to your greeting. Recent conversation review found this "
+            "unresolved help exchange where they expressed distress or dissatisfaction:\n"
+            f"{excerpt}\n\nWrite one brief, natural repair check-in. Use the actual problem only "
+            "if the excerpt makes it clear. Take responsibility for your part, ask whether that "
+            "problem is what is bothering them, and leave room for another explanation. Do not "
+            "state that they are angry as a fact, repeat a stock phrase, or make up their name. "
+            "Do not schedule or announce a reminder."
+        ),
+        "reaction_event": "thumbs_up_on_current_greeting",
+        "recent_conversation": memory.recent_conversation(limit=8),
+        "recent_distress_context": distress_context,
+        "retrieved_durable_memories": memory.retrieve_memories(query, limit=4),
+        "thought_threads": [memory.thread_context(item["id"], limit=5) for item in related_threads],
+        "temporary_affect_cue": memory.current_affect_state(),
+    }
+    result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
+    reply = result.get("reply", "").strip()
+    return reply or None
 
 
 def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
