@@ -2,6 +2,19 @@
 
 An experimental assistant application for persistent thoughts, long-term memory, and proactive follow-ups. It uses a hosted LLM through an OpenAI-compatible API; it is not a newly trained or fine-tuned model.
 
+## Updates & features
+
+### MrTrench 1.1
+
+- Multi-user chat with separate accounts, conversation history, durable memories, and resumable thought threads.
+- Background reflection, multiple reminders per message, and private follow-ups for meaningful emotional check-ins.
+- Installable web app with optional browser push notifications and adjustable chat appearance.
+
+### MrTrench 1.2
+
+- Double-tap or double-click an assistant message to react with ❤️; clear happy mood statements get a locally recognized, curious response.
+- A 👍 on a greeting triggers a varied, context-aware repair check-in only when recent conversation shows unresolved distress during a help exchange. Relevant conversation and memory are used; resolved issues and greetings without that history stay quiet.
+
 ## Project files and local data
 
 - `thought_memory.py` implements the SQLite-backed conversation, thought, memory, and follow-up store.
