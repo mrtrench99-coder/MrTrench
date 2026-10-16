@@ -54,6 +54,10 @@ python .\web_app.py
 
 Open `http://127.0.0.1:8765` in your browser. Add the Groq API key under **Settings**; in local mode, the key stays in memory for the current run and is not saved to disk. **Test API key** checks provider authentication without making a model completion. It distinguishes `invalid_api_key` responses from provider 403 access/security errors and 429 rate/quota errors. The interface includes the conversation, saved thought threads, memories, follow-ups, a background worker toggle, a manual reflection button, an outreach pause, and selectable color themes. The default graphite theme uses a black background with soft grey panels. Stop it with Ctrl+C in that one terminal window.
 
+### Install MrTrench like an app
+
+The hosted website can be installed on supported browsers and added to a phone's Home Screen. Open the deployed HTTPS site, choose **Install app** at the top, and accept the browser prompt. On iPhone or iPad, open the site in Safari, tap **Share → Add to Home Screen**, then open MrTrench from its new icon. Android browsers typically offer **Install app** or **Add to Home Screen** from the page button or browser menu. Installation is per device and does not create a separate account; sign in with the same account on each device.
+
 ### Free multi-user hosted beta
 
 Hosted mode uses Supabase Auth for sign-up/sign-in and a Supabase Postgres row per account for its saved thought database and encrypted provider settings. The browser never receives a saved Groq key. Row Level Security restricts each account to its own row. Local mode keeps its existing SQLite behavior.
