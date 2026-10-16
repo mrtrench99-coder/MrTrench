@@ -15,3 +15,9 @@ services:
         sync: false
       - key: MR_TRENCH_ENCRYPTION_KEY
         sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:mrtrench99@gmail.com

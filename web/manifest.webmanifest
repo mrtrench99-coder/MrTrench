@@ -1,0 +1,14 @@
+{
+  "id": "/",
+  "name": "MrTrench",
+  "short_name": "MrTrench",
+  "description": "A personal thought companion with reminders.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0b0c0e",
+  "theme_color": "#0b0c0e",
+  "icons": [
+    { "src": "/mrtrench-logo.png", "sizes": "any", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

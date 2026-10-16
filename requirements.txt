@@ -1,1 +1,2 @@
 cryptography>=44,<47
+pywebpush>=2,<3

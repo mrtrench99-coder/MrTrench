@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -83,6 +84,47 @@ def _persist_memory(user_id: str | None, access_token: str, store: ThoughtMemory
         return
     database = Path(store.database)
     multiuser.save_memory_blob(user_id, access_token, database.read_bytes())
+
+
+def _send_push_notifications(store: ThoughtMemory, trigger: dict[str, object]) -> bool:
+    private_key = os.getenv("VAPID_PRIVATE_KEY", "")
+    subject = os.getenv("VAPID_SUBJECT", "")
+    subscriptions = store.list_push_subscriptions()
+    if not private_key or not subject or not subscriptions:
+        return False
+    try:
+        from pywebpush import WebPushException, webpush
+    except ImportError:
+        return False
+    purpose = str(trigger.get("purpose", ""))
+    kind = str(trigger.get("kind", ""))
+    if purpose == "mood":
+        title, body = "MrTrench is checking in", "Just checking how you're doing."
+    elif kind == "reminder":
+        title, body = "MrTrench reminder", f"It's time for: {trigger.get('title', 'your reminder')}"
+    else:
+        title, body = "MrTrench wants to check in", str(trigger.get("title", "A thought to pick up"))
+    payload = json.dumps({"title": title, "body": body, "url": "/"})
+    for subscription in subscriptions:
+        try:
+            webpush(subscription_info=subscription, data=payload, vapid_private_key=private_key,
+                    vapid_claims={"sub": subject}, ttl=86400)
+        except WebPushException as exc:
+            if getattr(exc, "response", None) is not None and exc.response.status_code in {404, 410}:
+                store.remove_push_subscription(str(subscription.get("endpoint", "")))
+        except Exception:
+            continue
+    return True
+
+
+def _valid_push_endpoint(endpoint: str) -> bool:
+    parsed = urlparse(endpoint)
+    hostname = (parsed.hostname or "").lower()
+    allowed = (".push.services.mozilla.com", ".push.apple.com", ".notify.windows.com",
+               ".googleapis.com", ".push.services.mozaws.com")
+    return parsed.scheme == "https" and bool(hostname) and not parsed.username and not parsed.password and (
+        any(hostname.endswith(suffix) for suffix in allowed) or hostname in {"fcm.googleapis.com"}
+    )
 
 
 def _clean_base_url(value: object) -> str:
@@ -183,25 +225,32 @@ def _background_loop() -> None:
         for user_id, access_token in tenants:
             try:
                 user_settings = _settings_for(user_id, access_token)
-                if not (user_settings["worker_enabled"] and user_settings["api_key"]):
-                    continue
                 interval = int(user_settings["interval_seconds"])
                 now = time.monotonic()
                 next_review = getattr(_background_loop, "next_review", {})
                 retry_map = getattr(_background_loop, "retry_after", {})
                 next_review.setdefault(str(user_id), now + interval)
                 retry_map.setdefault(str(user_id), 0.0)
-                if now < retry_map[str(user_id)]:
-                    continue
                 store = _memory_for(user_id, access_token)
                 lock = state_lock if user_id is None else _lock_for(user_id)
                 with lock:
-                    processed = process_due_triggers(
-                        store, model=str(user_settings["model"]),
-                        api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
-                    if processed:
-                        _persist_memory(user_id, access_token, store)
-                    if now >= next_review[str(user_id)]:
+                    now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    for trigger in store.due_unnotified_triggers(now_utc):
+                        if trigger["kind"] == "check_in" and store.proactive_paused():
+                            continue
+                        if _send_push_notifications(store, trigger):
+                            store.mark_trigger_notified(trigger["id"])
+                            _persist_memory(user_id, access_token, store)
+                    can_run = bool(user_settings["worker_enabled"] and user_settings["api_key"])
+                    if can_run and now >= retry_map[str(user_id)]:
+                        processed = process_due_triggers(
+                            store, model=str(user_settings["model"]),
+                            api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
+                        if processed:
+                            _persist_memory(user_id, access_token, store)
+                    else:
+                        processed = 0
+                    if can_run and now >= retry_map[str(user_id)] and now >= next_review[str(user_id)]:
                         run_cycle(store, model=str(user_settings["model"]),
                                   api_key=str(user_settings["api_key"]), base_url=str(user_settings["base_url"]))
                         next_review[str(user_id)] = now + interval
@@ -337,6 +386,19 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
             self._json({"hosted": multiuser.HOSTED_MODE, "authenticated": bool(user_id),
                         "user": {"email": user.get("email", "")} if user else None}, headers=headers)
             return
+        if self.path == "/api/push/config":
+            try:
+                user_id, _ = self._require_user()
+                store = _memory_for(user_id, getattr(self, "_access_token", ""))
+                configured = bool(os.getenv("VAPID_PUBLIC_KEY") and os.getenv("VAPID_PRIVATE_KEY")
+                                 and os.getenv("VAPID_SUBJECT"))
+                self._json({"configured": configured,
+                            "public_key": os.getenv("VAPID_PUBLIC_KEY", "") if configured else "",
+                            "subscriptions": len(store.list_push_subscriptions())},
+                           headers=getattr(self, "_auth_cookie_headers", {}))
+            except PermissionError as exc:
+                self._json({"error": str(exc)}, 401)
+            return
         if self.path == "/api/state":
             try:
                 user_id, _ = self._require_user()
@@ -353,6 +415,8 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
         content_type = {
             ".html": "text/html; charset=utf-8",
             ".png": "image/png",
+            ".js": "text/javascript; charset=utf-8",
+            ".webmanifest": "application/manifest+json; charset=utf-8",
         }.get(target.suffix.lower(), "application/octet-stream")
         body = target.read_bytes()
         self.send_response(200)
@@ -483,6 +547,46 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                     raise ValueError("Choose a follow-up to cancel.")
                 with lock:
                     store.cancel_trigger(trigger_id, note="Cancelled from the web interface.")
+                    _persist_memory(user_id, access_token, store)
+                self._json({"ok": True})
+            elif self.path == "/api/followups/reschedule":
+                trigger_id = str(body.get("id", ""))
+                try:
+                    due_at = datetime.fromisoformat(str(body.get("due_at", "")))
+                except ValueError as exc:
+                    raise ValueError("Choose a valid new date and time.") from exc
+                if not trigger_id or due_at.tzinfo is None:
+                    raise ValueError("Choose a valid new date and time.")
+                if due_at <= datetime.now(timezone.utc):
+                    raise ValueError("The new time must be in the future.")
+                with lock:
+                    try:
+                        store.reschedule_trigger(trigger_id, due_at.astimezone(timezone.utc).isoformat(timespec="seconds"))
+                    except KeyError as exc:
+                        raise ValueError("That follow-up is no longer pending.") from exc
+                    _persist_memory(user_id, access_token, store)
+                self._json({"ok": True})
+            elif self.path == "/api/push/subscribe":
+                subscription = body.get("subscription")
+                if not isinstance(subscription, dict):
+                    raise ValueError("The browser did not provide a valid push subscription.")
+                endpoint = str(subscription.get("endpoint", ""))
+                keys = subscription.get("keys")
+                if (not _valid_push_endpoint(endpoint) or not isinstance(keys, dict)
+                        or not isinstance(keys.get("p256dh"), str) or not isinstance(keys.get("auth"), str)):
+                    raise ValueError("The browser push subscription is invalid.")
+                if not (os.getenv("VAPID_PUBLIC_KEY") and os.getenv("VAPID_PRIVATE_KEY") and os.getenv("VAPID_SUBJECT")):
+                    raise ValueError("Push notifications are not configured on the server yet.")
+                with lock:
+                    store.save_push_subscription(subscription)
+                    _persist_memory(user_id, access_token, store)
+                self._json({"ok": True})
+            elif self.path == "/api/push/unsubscribe":
+                endpoint = str(body.get("endpoint", ""))
+                if not endpoint:
+                    raise ValueError("Choose this device's notification subscription.")
+                with lock:
+                    store.remove_push_subscription(endpoint)
                     _persist_memory(user_id, access_token, store)
                 self._json({"ok": True})
             elif self.path == "/api/reaction":

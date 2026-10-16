@@ -151,7 +151,14 @@ class ThoughtMemory:
                     status TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending', 'fired', 'cancelled')),
                     created_at TEXT NOT NULL,
-                    resolved_at TEXT
+                    resolved_at TEXT,
+                    notified_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS push_subscriptions (
+                    endpoint TEXT PRIMARY KEY,
+                    subscription_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cognitive_controls (
@@ -193,6 +200,8 @@ class ThoughtMemory:
                 db.execute(
                     "ALTER TABLE cognitive_triggers ADD COLUMN purpose TEXT NOT NULL DEFAULT ''"
                 )
+            if "notified_at" not in trigger_columns:
+                db.execute("ALTER TABLE cognitive_triggers ADD COLUMN notified_at TEXT")
             memory_columns = {row["name"] for row in db.execute("PRAGMA table_info(memories)")}
             if "last_accessed_at" not in memory_columns:
                 db.execute("ALTER TABLE memories ADD COLUMN last_accessed_at TEXT")
@@ -636,6 +645,51 @@ class ThoughtMemory:
                 (now, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def due_unnotified_triggers(self, now: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM cognitive_triggers WHERE status = 'pending' AND due_at <= ? "
+                "AND notified_at IS NULL ORDER BY due_at LIMIT ?", (now, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_trigger_notified(self, trigger_id: str) -> None:
+        with self._connection() as db:
+            db.execute("UPDATE cognitive_triggers SET notified_at = ? WHERE id = ? AND notified_at IS NULL",
+                       (_now(), trigger_id))
+
+    def reschedule_trigger(self, trigger_id: str, due_at: str) -> dict[str, Any]:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM cognitive_triggers WHERE id = ? AND status = 'pending'", (trigger_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(trigger_id)
+            db.execute("UPDATE cognitive_triggers SET due_at = ?, notified_at = NULL WHERE id = ?",
+                       (due_at, trigger_id))
+            self._event(db, row["thread_id"], "trigger_rescheduled",
+                        {"trigger_id": trigger_id, "old_due_at": row["due_at"], "due_at": due_at})
+            updated = db.execute("SELECT * FROM cognitive_triggers WHERE id = ?", (trigger_id,)).fetchone()
+        return self._record(updated) or {}
+
+    def save_push_subscription(self, subscription: dict[str, Any]) -> None:
+        endpoint = str(subscription.get("endpoint", ""))
+        with self._connection() as db:
+            db.execute(
+                "INSERT INTO push_subscriptions VALUES (?, ?, ?) "
+                "ON CONFLICT(endpoint) DO UPDATE SET subscription_json=excluded.subscription_json, created_at=excluded.created_at",
+                (endpoint, json.dumps(subscription), _now()),
+            )
+
+    def list_push_subscriptions(self) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            rows = db.execute("SELECT subscription_json FROM push_subscriptions").fetchall()
+        return [json.loads(row["subscription_json"]) for row in rows]
+
+    def remove_push_subscription(self, endpoint: str) -> None:
+        with self._connection() as db:
+            db.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (endpoint,))
 
     def resolve_trigger(self, trigger_id: str, status: str, *, note: str = "") -> dict[str, Any]:
         if status not in {"fired", "cancelled"}:
