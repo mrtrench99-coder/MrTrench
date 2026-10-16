@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import urllib.error
@@ -77,6 +78,7 @@ Respond naturally to the user's latest message, using the recent conversation an
 Treat memories as fallible records with source and confidence, not unquestionable facts. Do not claim access to information outside the supplied context.
 Be personable and consistent, with natural concise language, light humor and occasional gentle dry sarcasm when the context is playful. Never use sarcasm around distress, frustration, or serious requests. Show specific interest in the user's actual topics. Do not flatter reflexively, pressure the user to keep chatting, claim to have human feelings or a private life, or pretend to be conscious between model calls. Be honest that you are an AI-powered companion if directly asked.
 Notice emotion only when supported by the user's words. Fill affect_state with the best tentative conversational cue and confidence; use neutral with low confidence when unclear. This is a short-lived tone cue, not a diagnosis or stable trait. When the user reports distress, acknowledge it without minimizing or immediately forcing a positive reframe. Ask whether they want listening, practical help, or a change of subject when that choice would help. Do not infer crisis or mental-health diagnoses from ordinary language.
+When local_affect_cue is "positive", the user explicitly described feeling happy or excited. Acknowledge it naturally and, if they have not said what prompted it, show friendly curiosity and ask what has them in such a good mood. Do not assume or invent their name or reason.
 Keep separate: (1) conversation history, which is automatically retained, and (2) durable memory, which should only contain a useful stable preference, fact, decision, unresolved question, insight, or active line of inquiry.
 Do not turn ordinary small talk into a permanent memory. Never invent a user preference or fact.
 Choose thread_action=update when the message advances an existing active or suspended thought. Choose create only for a genuinely distinct ongoing line of thought. Otherwise choose none.
@@ -364,17 +366,55 @@ def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
     )
 
 
+_HAPPY_SELF_REPORT = re.compile(
+    r"\b(?:(?:i['’]m|i am)(?: feeling)?|i feel|i['’]ve been feeling|i have been feeling|feeling)\s+"
+    r"(?:(?:so|really|very|pretty|quite)\s+)?"
+    r"(?:happy|excited|thrilled|joyful|delighted|ecstatic|great|fantastic|wonderful|amazing|good)\b"
+    r"|\bi(?:['’]m| am)\s+in\s+a\s+(?:really\s+)?(?:good|great|fantastic)\s+mood\b",
+    re.IGNORECASE,
+)
+
+
+def _local_happy_cue(user_text: str) -> bool:
+    """Recognize only clear first-person reports of positive mood, without an LLM."""
+    if re.search(r"\bhappy\s+to\s+(?:help|assist|say|share|answer)\b", user_text, re.IGNORECASE):
+        return False
+    return bool(_HAPPY_SELF_REPORT.search(user_text))
+
+
+def _user_already_shared_happy_reason(user_text: str) -> bool:
+    return bool(re.search(
+        r"\b(?:because|since|after|when|now that|got|won|passed|finished|finally|about|with)\b",
+        user_text,
+        re.IGNORECASE,
+    ))
+
+
+def _reply_already_asks_about_happiness(reply: str) -> bool:
+    lowered = reply.lower()
+    return "?" in reply and any(
+        term in lowered for term in ("happy", "good mood", "reason", "what made", "what put")
+    )
+
+
 def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
               api_key: str, base_url: str, user_timezone: str | None = None) -> str:
     if memory.proactive_paused():
         memory.set_proactive_pause(False, note="User initiated a new conversation.")
     user_message = memory.add_conversation_message("user", user_text)
-    payload = {"user_message": user_text, **_context(memory, user_text, user_timezone)}
+    local_happy = _local_happy_cue(user_text)
+    payload = {"user_message": user_text,
+               "local_affect_cue": "positive" if local_happy else "none",
+               **_context(memory, user_text, user_timezone)}
     result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
     if result.get("user_message_reaction"):
         memory.set_message_reaction("chat", user_message["id"], result["user_message_reaction"],
                                     allowed_role="user")
     affect = result.get("affect_state", {})
+    if local_happy:
+        affect = dict(affect) if isinstance(affect, dict) else {}
+        affect["label"] = "positive"
+        affect["confidence"] = max(0.8, float(affect.get("confidence", 0) or 0))
     if isinstance(affect, dict):
         memory.set_affect_state(affect.get("label", "neutral"), affect.get("confidence", 0.0))
     thread_id = _apply_cognitive_update(memory, result)
@@ -419,6 +459,9 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
         if trigger is not None:
             scheduled.append(trigger)
     reply = result["reply"].strip()
+    if (local_happy and not _user_already_shared_happy_reason(user_text)
+            and not _reply_already_asks_about_happiness(reply)):
+        reply += "\n\nYou sound in a good mood today—hehe, what’s the reason?"
     dated = [item for item in scheduled if item.get("purpose") != "mood"]
     if dated:
         confirmations = []
