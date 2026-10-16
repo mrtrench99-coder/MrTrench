@@ -52,7 +52,7 @@ Run one local process from the project folder:
 python .\web_app.py
 ```
 
-Open `http://127.0.0.1:8765` in your browser. Add the Groq API key under **Settings**; in local mode, the key stays in memory for the current run and is not saved to disk. **Test API key** checks provider authentication without making a model completion. It distinguishes `invalid_api_key` responses from provider 403 access/security errors and 429 rate/quota errors. The interface includes the conversation, saved thought threads, memories, follow-ups, a background worker toggle, a manual reflection button, an outreach pause, and selectable color themes. The default graphite theme uses a black background with soft grey panels. Stop it with Ctrl+C in that one terminal window.
+Open `http://127.0.0.1:8765` in your browser. Add the Groq API key under **Settings**; in local mode, the key stays in memory for the current run and is not saved to disk. **Test API key** checks provider authentication without making a model completion. It distinguishes `invalid_api_key` responses from provider 403 access/security errors and 429 rate/quota errors. The interface includes the conversation, saved thought threads, memories, follow-ups, a background worker toggle, a manual reflection button, an outreach pause, and selectable color themes. Reacting 👍 to a current greeting gets a brief playful, sarcastic check-in; sarcasm is avoided around distress or serious topics. The default graphite theme uses a black background with soft grey panels. Stop it with Ctrl+C in that one terminal window.
 
 ### Install MrTrench like an app
 

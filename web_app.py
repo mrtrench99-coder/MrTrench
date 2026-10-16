@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import http.cookies
 import tempfile
 import threading
@@ -125,6 +126,22 @@ def _valid_push_endpoint(endpoint: str) -> bool:
     return parsed.scheme == "https" and bool(hostname) and not parsed.username and not parsed.password and (
         any(hostname.endswith(suffix) for suffix in allowed) or hostname in {"fcm.googleapis.com"}
     )
+
+
+def _is_current_assistant_greeting(store: ThoughtMemory, message_id: str) -> bool:
+    """Only treat a thumbs-up as a cue when it targets the current greeting."""
+    recent = store.recent_conversation(limit=30)
+    if not recent or recent[-1].get("id") != message_id or recent[-1].get("role") != "assistant":
+        return False
+    content = re.sub(r"^[^\w]+", "", str(recent[-1].get("content", "")).strip().lower())
+    return bool(re.match(
+        r"^(?:good\s+(?:morning|afternoon|evening|night)|morning|afternoon|evening|hello|hi|hey)\b",
+        content,
+    ))
+
+
+def _greeting_reaction_follow_up() -> str:
+    return "A thumbs-up after my good morning? Scathing review. 😏 What’s going on, all good?"
 
 
 def _clean_base_url(value: object) -> str:
@@ -595,10 +612,15 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 emoji = str(body.get("emoji", ""))
                 if emoji not in {"", "🙂", "❤️", "😂", "👏", "🤔", "👍"}:
                     raise ValueError("Choose one of the available emoji reactions.")
+                follow_up = None
                 with lock:
                     store.set_message_reaction(message_type, message_id, emoji)
+                    if (emoji == "👍" and message_type == "chat"
+                            and _is_current_assistant_greeting(store, message_id)):
+                        follow_up = store.add_conversation_message(
+                            "assistant", _greeting_reaction_follow_up())
                     _persist_memory(user_id, access_token, store)
-                self._json({"ok": True})
+                self._json({"ok": True, "follow_up": follow_up is not None})
             else:
                 self._json({"error": "Not found."}, 404)
         except PermissionError as exc:
