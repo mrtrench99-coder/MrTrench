@@ -7,13 +7,19 @@ An experimental assistant application for persistent thoughts, long-term memory,
 ### MrTrench 1.1
 
 - Multi-user chat with separate accounts, conversation history, durable memories, and resumable thought threads.
-- Background reflection, multiple reminders per message, and private follow-ups for meaningful emotional check-ins.
+- Background reflection, multiple reminders per message, and cancellable emotional check-ins.
 - Installable web app with optional browser push notifications and adjustable chat appearance.
 
 ### MrTrench 1.2
 
 - Double-tap or double-click an assistant message to react with ❤️; clear happy mood statements get a locally recognized, curious response.
 - A 👍 on a greeting triggers a varied, context-aware repair check-in only when recent conversation shows unresolved distress during a help exchange. Relevant conversation and memory are used; resolved issues and greetings without that history stay quiet.
+
+### MrTrench 1.3
+
+- Positive-mood detection ignores skill claims and routine “I’m good, thanks” greetings.
+- Invalid reminder dates no longer discard the assistant’s reply; confirmations use the user’s timezone.
+- Mood check-ins appear in **Follow-ups** and can be rescheduled or cancelled. Hosted workers refresh expired sessions while active; Render Free can still sleep, so reminders there may be delayed.
 
 ## Project files and local data
 
@@ -75,7 +81,7 @@ The hosted website can be installed on supported browsers and added to a phone's
 
 Hosted mode uses Supabase Auth for sign-up/sign-in and a Supabase Postgres row per account for its saved thought database and encrypted provider settings. The browser never receives a saved Groq key. Row Level Security restricts each account to its own row. Local mode keeps its existing SQLite behavior.
 
-This is a free-tier prototype, not a production service. Render Free sleeps after 15 minutes without traffic and has no persistent filesystem; memory data is stored in Supabase for that reason. Supabase Free projects may pause after a week of low database activity. The background process stops while Render sleeps, so reminders and push notifications may be late until someone visits the app again. User data is not migrated from the local `thought_memory.sqlite3`. Hosted mode currently restricts model requests to Groq's official endpoint. See [Render free service limits](https://render.com/docs/free) and [Supabase project pausing](https://supabase.com/docs/guides/platform/free-project-pausing).
+This is a free-tier prototype, not a production service. Render Free sleeps after 15 minutes without traffic and has no persistent filesystem; memory data is stored in Supabase for that reason. Supabase Free projects may pause after a week of low database activity. The background process stops while Render sleeps, so reminders and push notifications may be late until someone visits the app again; the free host cannot guarantee on-time delivery. Hosted workers refresh expired sessions while the server process is awake, but they need an active signed-in session in that running process. For dependable reminders, use an always-on worker or an external scheduler. User data is not migrated from the local `thought_memory.sqlite3`. Hosted mode currently restricts model requests to Groq's official endpoint. See [Render free service limits](https://render.com/docs/free) and [Supabase project pausing](https://supabase.com/docs/guides/platform/free-project-pausing).
 
 #### Set up the free host
 

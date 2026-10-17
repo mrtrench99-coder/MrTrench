@@ -41,12 +41,43 @@ tenant_locks: dict[str, threading.RLock] = {}
 tenant_locks_guard = threading.Lock()
 hosted_memories: dict[str, ThoughtMemory] = {}
 active_tenant_tokens: dict[str, str] = {}
+active_tenant_refresh_tokens: dict[str, str] = {}
+tenant_user_by_access: dict[str, str] = {}
+tenant_refresh_locks: dict[str, threading.Lock] = {}
 hosted_settings: dict[str, dict[str, object]] = {}
 
 
 def _lock_for(user_id: str) -> threading.RLock:
     with tenant_locks_guard:
         return tenant_locks.setdefault(user_id, threading.RLock())
+
+
+def _refresh_lock_for(user_id: str) -> threading.Lock:
+    with tenant_locks_guard:
+        return tenant_refresh_locks.setdefault(user_id, threading.Lock())
+
+
+def _refresh_active_tenant(user_id: str) -> str:
+    """Keep hosted workers alive across Supabase access-token expiry."""
+    with _refresh_lock_for(user_id):
+        with settings_lock:
+            access = active_tenant_tokens.get(user_id, "")
+            refresh = active_tenant_refresh_tokens.get(user_id, "")
+        if access and multiuser.user_for_token(access):
+            return access
+        if not refresh:
+            raise ValueError("This account's session expired. Sign in again to resume background work.")
+        session = multiuser.refresh_session(refresh)
+        next_access = str(session.get("access_token", ""))
+        user = multiuser.user_for_token(next_access)
+        if not next_access or not user or str(user.get("id", "")).lower() != user_id:
+            raise ValueError("Could not refresh this account's session. Sign in again to resume background work.")
+        with settings_lock:
+            tenant_user_by_access[access] = user_id
+            active_tenant_tokens[user_id] = next_access
+            active_tenant_refresh_tokens[user_id] = str(session.get("refresh_token", refresh))
+            tenant_user_by_access[next_access] = user_id
+        return next_access
 
 
 def _settings_for(user_id: str | None, access_token: str = "") -> dict[str, object]:
@@ -211,9 +242,8 @@ def _snapshot(user_id: str | None = None, access_token: str = "") -> dict[str, o
             "threads": store.list_threads(status="active", limit=30)
             + store.list_threads(status="suspended", limit=30),
             "memories": store.recent_memories(limit=50),
-            # Emotion-based check-ins are internal attention cues, not user-facing tasks.
-            "follow_ups": [item for item in store.pending_triggers(limit=100)
-                           if item.get("purpose") != "mood"],
+            # Include mood check-ins so users can review, reschedule, or cancel them.
+            "follow_ups": store.pending_triggers(limit=100),
             "proactive_paused": store.proactive_paused(),
             "worker": {
                 "enabled": bool(user_settings["worker_enabled"]),
@@ -237,6 +267,8 @@ def _background_loop() -> None:
             tenants = [(None, "")]
         for user_id, access_token in tenants:
             try:
+                if user_id is not None:
+                    access_token = _refresh_active_tenant(user_id)
                 user_settings = _settings_for(user_id, access_token)
                 interval = int(user_settings["interval_seconds"])
                 now = time.monotonic()
@@ -361,23 +393,43 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
         user = multiuser.user_for_token(token)
         if user:
             user_id = str(user["id"]).lower()
-            self._access_token = token
             with settings_lock:
-                active_tenant_tokens[user_id] = token
+                current = active_tenant_tokens.get(user_id, "")
+            # A worker may already have rotated this session. Keep its newer
+            # credentials instead of replacing them with an older browser cookie.
+            if not current or current == token or not multiuser.user_for_token(current):
+                with settings_lock:
+                    active_tenant_tokens[user_id] = token
+                    tenant_user_by_access[token] = user_id
+                    cookie_refresh = self._cookie("mrtrench_refresh")
+                    if cookie_refresh:
+                        active_tenant_refresh_tokens[user_id] = cookie_refresh
+            self._access_token = current if current and multiuser.user_for_token(current) else token
             return user_id, user
         refresh_token = self._cookie("mrtrench_refresh")
         if refresh_token:
             try:
-                session = multiuser.refresh_session(refresh_token)
-                token = str(session.get("access_token", ""))
-                user = multiuser.user_for_token(token)
+                with settings_lock:
+                    known_user_id = tenant_user_by_access.get(token)
+                if known_user_id and active_tenant_refresh_tokens.get(known_user_id):
+                    token = _refresh_active_tenant(known_user_id)
+                    with settings_lock:
+                        rotated_refresh = active_tenant_refresh_tokens.get(known_user_id, refresh_token)
+                    user = multiuser.user_for_token(token)
+                else:
+                    session = multiuser.refresh_session(refresh_token)
+                    token = str(session.get("access_token", ""))
+                    rotated_refresh = str(session.get("refresh_token", refresh_token))
+                    user = multiuser.user_for_token(token)
                 if user:
                     self._auth_cookie_headers = self._session_headers(
-                        token, str(session.get("refresh_token", refresh_token)))
+                        token, rotated_refresh)
                     user_id = str(user["id"]).lower()
                     self._access_token = token
                     with settings_lock:
                         active_tenant_tokens[user_id] = token
+                        active_tenant_refresh_tokens[user_id] = rotated_refresh
+                        tenant_user_by_access[token] = user_id
                     return user_id, user
             except ValueError:
                 pass
@@ -470,7 +522,9 @@ class MrTrenchHandler(BaseHTTPRequestHandler):
                 user = multiuser.user_for_token(token) if multiuser.HOSTED_MODE else None
                 if user:
                     with settings_lock:
-                        active_tenant_tokens.pop(str(user.get("id", "")).lower(), None)
+                        user_id = str(user.get("id", "")).lower()
+                        active_tenant_tokens.pop(user_id, None)
+                        active_tenant_refresh_tokens.pop(user_id, None)
                 self._json({"ok": True}, headers=self._session_headers(clear=True))
                 return
             user_id, _ = self._require_user()

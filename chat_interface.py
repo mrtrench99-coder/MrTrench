@@ -331,7 +331,7 @@ def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
     kind = result.get("kind", "none")
     if kind not in {"reminder", "check_in"}:
         return None
-    title = result.get("title", "").strip()
+    title = str(result.get("title") or "").strip()
     if not title:
         return None
     category = result.get("category", "none")
@@ -341,26 +341,37 @@ def _schedule_follow_up(memory: ThoughtMemory, result: dict[str, Any], *,
             if (pending.get("purpose") == category and
                     " ".join(pending["title"].casefold().split()) == normalized_title):
                 return pending
-    delay = random.randint(5, 30) if category == "mood" else result.get("delay_minutes", 0)
-    due_value = result.get("due_at", "").strip()
+    raw_delay = random.randint(5, 30) if category == "mood" else result.get("delay_minutes", 0)
+    try:
+        delay = int(raw_delay or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    due_value = str(result.get("due_at") or "").strip()
     try:
         tz = ZoneInfo(user_timezone) if user_timezone else datetime.now().astimezone().tzinfo
     except (ZoneInfoNotFoundError, ValueError):
         tz = datetime.now().astimezone().tzinfo
     now_local = datetime.now(tz)
-    if delay > 0:
-        due = now_local + timedelta(minutes=delay)
-    elif due_value:
-        due = datetime.fromisoformat(due_value)
-        if due.tzinfo is None:
-            due = due.replace(tzinfo=now_local.tzinfo)
-    else:
+    try:
+        if delay > 0:
+            due = now_local + timedelta(minutes=delay)
+        elif due_value:
+            due = datetime.fromisoformat(str(due_value))
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=now_local.tzinfo)
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
         return None
     if due <= now_local:
         return None
+    try:
+        due_utc = due.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError):
+        return None
     return memory.schedule_trigger(
-        kind, title, due.astimezone(timezone.utc).isoformat(timespec="seconds"),
-        context=result.get("context", "").strip(), thread_id=thread_id,
+        kind, title, due_utc,
+        context=str(result.get("context") or "").strip(), thread_id=thread_id,
         pause_after_follow_up=(kind == "check_in" and bool(pause_after_follow_up)),
         purpose=category,
     )
@@ -396,6 +407,11 @@ _RECOVERY_CUE = re.compile(
 
 def _local_happy_cue(user_text: str) -> bool:
     """Recognize only clear first-person reports of positive mood, without an LLM."""
+    if re.search(r"\bgood\s+(?:at|with|for)\b", user_text, re.IGNORECASE):
+        return False
+    if re.search(r"\bi(?:['’]m| am)\s+good\b(?:\s*[,!.]?\s*(?:thanks|thank you|and you|how are you))?\s*[.!?]*$",
+                 user_text, re.IGNORECASE):
+        return False
     if re.search(r"\bhappy\s+to\s+(?:help|assist|say|share|answer)\b", user_text, re.IGNORECASE):
         return False
     return bool(_HAPPY_SELF_REPORT.search(user_text))
@@ -561,9 +577,13 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
         reply += "\n\nYou sound in a good mood today—hehe, what’s the reason?"
     dated = [item for item in scheduled if item.get("purpose") != "mood"]
     if dated:
+        try:
+            display_tz = ZoneInfo(user_timezone) if user_timezone else datetime.now().astimezone().tzinfo
+        except (ZoneInfoNotFoundError, ValueError):
+            display_tz = datetime.now().astimezone().tzinfo
         confirmations = []
         for item in dated:
-            due_local = datetime.fromisoformat(item["due_at"]).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+            due_local = datetime.fromisoformat(item["due_at"]).astimezone(display_tz).strftime("%Y-%m-%d %H:%M %Z")
             confirmations.append(f"{item['title']} — {due_local}")
         reply += "\n\nScheduled follow-ups:\n- " + "\n- ".join(confirmations)
     if failed:
