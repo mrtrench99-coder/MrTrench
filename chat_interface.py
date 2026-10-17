@@ -8,6 +8,7 @@ import os
 import random
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import urllib.error
 import urllib.request
@@ -37,8 +38,11 @@ CHAT_SCHEMA: dict[str, Any] = {
             "properties": {
                 "label": {"type": "string", "enum": ["neutral", "positive", "low", "stressed", "frustrated", "anxious", "uncertain", "tired", "mixed"]},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "subject": {"type": "string", "enum": ["user", "other_person", "fictional", "unclear"]},
+                "cause": {"type": "string", "enum": ["assistant", "task", "personal", "external", "unclear"]},
+                "evidence": {"type": "string"},
             },
-            "required": ["label", "confidence"],
+            "required": ["label", "confidence", "subject", "cause", "evidence"],
         },
         "thread_priority": {"type": "number", "minimum": 0, "maximum": 1},
         "related_thread_id": {"type": ["string", "null"]},
@@ -77,7 +81,7 @@ Your name is MrTrench; use he/him pronouns and never refer to yourself as “it.
 Respond naturally to the user's latest message, using the recent conversation and supplied memory context.
 Treat memories as fallible records with source and confidence, not unquestionable facts. Do not claim access to information outside the supplied context.
 Be personable and consistent, with natural concise language, light humor and occasional gentle dry sarcasm when the context is playful. Never use sarcasm around distress, frustration, or serious requests. Show specific interest in the user's actual topics. Do not flatter reflexively, pressure the user to keep chatting, claim to have human feelings or a private life, or pretend to be conscious between model calls. Be honest that you are an AI-powered companion if directly asked.
-Notice emotion only when supported by the user's words. Fill affect_state with the best tentative conversational cue and confidence; use neutral with low confidence when unclear. This is a short-lived tone cue, not a diagnosis or stable trait. When the user reports distress, acknowledge it without minimizing or immediately forcing a positive reframe. Ask whether they want listening, practical help, or a change of subject when that choice would help. Do not infer crisis or mental-health diagnoses from ordinary language.
+Notice emotion only when supported by the user's words and the recent conversation. Fill affect_state with the best tentative cue, confidence, subject, cause, and a short exact quote from the user's words as evidence. Distinguish the user's present feeling from feelings attributed to another person or a fictional character, quoted text, sarcasm, idioms, ordinary politeness, and task evaluation. “I’m good at Python” and “I’m good, thanks” are not positive mood reports. A frustrated complaint about your answer is the user's frustration directed at you; it is not automatically evidence that the user feels generally low. Use the synthetic contrast examples in the payload to calibrate these distinctions; follow their decision boundaries, not their exact wording. Use neutral or uncertain with low confidence when context is ambiguous. This is a short-lived tone cue, not a diagnosis or stable trait. When the user reports distress, acknowledge it without minimizing or immediately forcing a positive reframe. Ask whether they want listening, practical help, or a change of subject when that choice would help. Do not infer crisis or mental-health diagnoses from ordinary language.
 When local_affect_cue is "positive", the user explicitly described feeling happy or excited. Acknowledge it naturally and, if they have not said what prompted it, show friendly curiosity and ask what has them in such a good mood. Do not assume or invent their name or reason.
 Keep separate: (1) conversation history, which is automatically retained, and (2) durable memory, which should only contain a useful stable preference, fact, decision, unresolved question, insight, or active line of inquiry.
 Do not turn ordinary small talk into a permanent memory. Never invent a user preference or fact.
@@ -86,6 +90,19 @@ If resuming a suspended thread, state why in resume_note. If a durable memory is
 Treat meaningful plans, unresolved decisions, upcoming events, ongoing problems, and user-chosen commitments as persistent thought threads. If there is a clear reason to revisit one, schedule one gentle follow-up. For explicit reminder requests, create one separate item in follow_ups for EACH distinct task, preserving each task's title and time independently. A message can contain multiple reminders; never drop, merge, or overwrite one with another. For relative times like “in 2 minutes,” use delay_minutes with the exact number of minutes and leave due_at empty. For absolute clock times, use due_at in the supplied user timezone with its UTC offset; do not use Z or UTC. Use category=explicit and kind=reminder. For meaningful plans, decisions, events, problems, or commitments, use category plan/decision/event/problem/commitment and kind=check_in; use a stated timing, or a reasonable delay of 1–3 days for an active concern with no timing. For low mood, reflect the emotion accurately in affect_state and let the application decide privately whether to check in later; do not create or announce a mood follow-up. Positive moods and casual mentions do not get check-ins. Never schedule more than 10 items in one response, and never invent an event date or user commitment. If the user asks you to stop contacting them after a follow-up, set pause_after_follow_up=true; explicit reminders must still run. If the user cancels a pending trigger, include its id in cancel_trigger_ids. Do not repeatedly schedule the same concern.
 Only react when the user clearly greets you (for example, hello or good morning) or explicitly expresses an emotion (for example, feeling happy, sad, worried, or frustrated). For questions, requests, ordinary statements, and other messages, set user_message_reaction to an empty string. When a greeting or clear emotion is present, choose one fitting emoji from the allowed set. Do not use a reaction as a substitute for answering. The user_message_reaction field is your reaction to the user's message.
 The reply should answer the user directly. Return JSON matching the required schema."""
+
+
+def _load_affect_examples() -> list[dict[str, Any]]:
+    """Load a compact synthetic contrast set for in-context affect calibration."""
+    try:
+        path = Path(__file__).resolve().parent / "resources" / "affect_context_examples.json"
+        examples = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return examples[:8] if isinstance(examples, list) else []
+
+
+AFFECT_CONTEXT_EXAMPLES = _load_affect_examples()
 
 
 def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
@@ -187,7 +204,8 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
             "user_message_reaction": "",
             "summary": "", "current_state": "", "resume_note": "",
             "memory_to_store": "", "memory_importance": 0.5,
-            "affect_state": {"label": "neutral", "confidence": 0.0},
+            "affect_state": {"label": "neutral", "confidence": 0.0,
+                             "subject": "unclear", "cause": "unclear", "evidence": ""},
             "thread_priority": 0.5, "related_thread_id": None, "relation": "related",
             "follow_ups": [],
             "pause_after_follow_up": False, "cancel_trigger_ids": [],
@@ -215,7 +233,19 @@ def _call_chat_model(payload: dict[str, Any], *, model: str, api_key: str,
                 affect_confidence = min(1.0, max(0.0, float(result["affect_state"].get("confidence", 0.0))))
             except (TypeError, ValueError):
                 affect_confidence = 0.0
-            result["affect_state"] = {"label": label, "confidence": affect_confidence}
+            subject = result["affect_state"].get("subject")
+            if subject not in {"user", "other_person", "fictional", "unclear"}:
+                subject = "unclear"
+            cause = result["affect_state"].get("cause")
+            if cause not in {"assistant", "task", "personal", "external", "unclear"}:
+                cause = "unclear"
+            evidence = result["affect_state"].get("evidence")
+            if not isinstance(evidence, str):
+                evidence = ""
+            result["affect_state"] = {
+                "label": label, "confidence": affect_confidence,
+                "subject": subject, "cause": cause, "evidence": evidence[:240],
+            }
         for key in ("memory_importance", "thread_priority"):
             try:
                 result[key] = min(1.0, max(0.0, float(result[key])))
@@ -388,7 +418,7 @@ _HAPPY_SELF_REPORT = re.compile(
 _DISTRESS_CUE = re.compile(
     r"\b(?:frustrat\w*|disappoint\w*|angry|upset|unhappy|not happy|hurt|annoyed|not satisfied|"
     r"not helpful|didn['’]?t help|couldn['’]?t help|not working|doesn['’]?t work|"
-    r"didn['’]?t work|still broken|still failing|useless|confusing|wrong answer)\b",
+    r"didn['’]?t work|still broken|still failing|useless|dumb|stupid|confusing|wrong answer)\b",
     re.IGNORECASE,
 )
 _BOT_PROBLEM_CUE = re.compile(
@@ -415,6 +445,25 @@ def _local_happy_cue(user_text: str) -> bool:
     if re.search(r"\bhappy\s+to\s+(?:help|assist|say|share|answer)\b", user_text, re.IGNORECASE):
         return False
     return bool(_HAPPY_SELF_REPORT.search(user_text))
+
+
+def _affect_evidence_supported(memory: ThoughtMemory, evidence: str) -> bool:
+    """Require the model's emotion evidence to occur in recent user-authored text."""
+    if not isinstance(evidence, str) or not evidence.strip():
+        return False
+    user_messages = [
+        str(item.get("content", ""))
+        for item in memory.recent_conversation(limit=20)
+        if item.get("role") == "user"
+    ][-8:]
+    source = " ".join(user_messages).casefold()
+    quoted = re.sub(r"[^\w']+", " ", evidence.casefold()).split()
+    ignored = {"i", "im", "ive", "am", "was", "were", "the", "a", "an", "and", "or", "but", "to", "of", "that", "this", "it", "feel", "feeling"}
+    terms = [term for term in quoted if len(term) > 2 and term not in ignored]
+    if not terms:
+        return False
+    source_terms = set(re.sub(r"[^\w']+", " ", source).split())
+    return sum(term in source_terms for term in terms) / len(terms) >= 0.75
 
 
 def _user_already_shared_happy_reason(user_text: str) -> bool:
@@ -518,6 +567,7 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
     local_happy = _local_happy_cue(user_text)
     payload = {"user_message": user_text,
                "local_affect_cue": "positive" if local_happy else "none",
+               "affect_reference_examples": AFFECT_CONTEXT_EXAMPLES,
                **_context(memory, user_text, user_timezone)}
     result = _call_chat_model(payload, model=model, api_key=api_key, base_url=base_url)
     if result.get("user_message_reaction"):
@@ -528,6 +578,9 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
         affect = dict(affect) if isinstance(affect, dict) else {}
         affect["label"] = "positive"
         affect["confidence"] = max(0.8, float(affect.get("confidence", 0) or 0))
+        affect["subject"] = "user"
+        affect["cause"] = "personal"
+        affect["evidence"] = user_text[:240]
     if isinstance(affect, dict):
         memory.set_affect_state(affect.get("label", "neutral"), affect.get("confidence", 0.0))
     thread_id = _apply_cognitive_update(memory, result)
@@ -538,6 +591,9 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
     scheduled = []
     failed = []
     for item in result.get("follow_ups", [])[:10]:
+        # Emotional follow-ups must pass the local evidence/ownership gate below.
+        if item.get("category") == "mood":
+            continue
         trigger = _schedule_follow_up(
             memory, item, thread_id=thread_id,
             pause_after_follow_up=result.get("pause_after_follow_up", False),
@@ -547,8 +603,8 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
             failed.append(item)
         else:
             scheduled.append(trigger)
-    # A clear negative affect cue should not depend on the model remembering
-    # to create a visible-looking follow-up object. Keep this check-in internal.
+    # Emotional follow-ups are created only by the app after checking ownership,
+    # confidence, and user-authored evidence.
     try:
         affect_confidence = float(affect.get("confidence", 0)) if isinstance(affect, dict) else 0.0
     except (TypeError, ValueError):
@@ -556,10 +612,17 @@ def chat_turn(memory: ThoughtMemory, user_text: str, *, model: str,
     negative_affect = isinstance(affect, dict) and affect.get("label") in {
         "low", "stressed", "frustrated", "anxious",
     }
+    affect_is_user_owned = isinstance(affect, dict) and affect.get("subject") == "user"
+    affect_has_evidence = isinstance(affect, dict) and _affect_evidence_supported(
+        memory, affect.get("evidence", "")
+    )
+    if isinstance(affect, dict) and affect.get("cause") == "assistant":
+        affect_has_evidence = affect_has_evidence and bool(_recent_unresolved_bot_distress(memory))
     mood_already_pending = any(
         item.get("purpose") == "mood" for item in memory.pending_triggers(limit=100)
     )
-    if negative_affect and affect_confidence >= 0.55 and not mood_already_pending:
+    if (negative_affect and affect_is_user_owned and affect_has_evidence
+            and affect_confidence >= 0.70 and not mood_already_pending):
         trigger = _schedule_follow_up(
             memory,
             {

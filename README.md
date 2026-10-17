@@ -21,10 +21,16 @@ An experimental assistant application for persistent thoughts, long-term memory,
 - Invalid reminder dates no longer discard the assistant’s reply; confirmations use the user’s timezone.
 - Mood check-ins appear in **Follow-ups** and can be rescheduled or cancelled. Hosted workers refresh expired sessions while active; Render Free can still sleep, so reminders there may be delayed.
 
+### MrTrench 1.4
+
+- Emotion reading distinguishes the user’s own mood from quoted, fictional, or other people’s feelings, and records an evidence quote and likely cause.
+- Synthetic contrast examples guide prompt calibration. Check-ins require stronger confidence and evidence from recent user messages; assistant-related frustration also needs a matching unresolved help exchange.
+
 ## Project files and local data
 
 - `thought_memory.py` implements the SQLite-backed conversation, thought, memory, and follow-up store.
 - `chat_interface.py` provides interactive chat, updates cognitive state, and schedules up to 10 separate follow-ups from one message.
+- `resources/affect_context_examples.json` contains synthetic contrast examples used to guide affect classification; they are not a fine-tuning dataset with validated accuracy.
 - `background_agent.py` evaluates due follow-ups and periodically reflects on recent conversation and thought state.
 - `web_app.py` serves a local browser UI for chat, threads, memories, follow-ups, and background controls; `web/index.html` contains its responsive interface and color themes.
 - `web/mrtrench-logo.png` is the current UI logo asset.
@@ -41,7 +47,7 @@ The model is called when a chat turn, due trigger, or reflection cycle needs it;
 
 This is an early research prototype for experimenting with stateful, cognition-inspired interaction. The current implementation provides persistent conversation history, resumable thought threads, durable memories, cross-thread links, time-based reminders, low-mood check-ins, and periodic background reflection. Its cognitive behavior comes from application logic and LLM prompts; it does not model or reproduce human cognition, and memory quality depends on the configured model and the context sent to it.
 
-The default LLM endpoint is Groq's OpenAI-compatible API with `openai/gpt-oss-20b`. Hosted providers can impose rate limits; a rate-limited request may need to be retried after the wait period stated in the error.
+The default LLM endpoint is Groq's OpenAI-compatible API with `openai/gpt-oss-20b`. Affect examples are included as prompt context; they do not train the hosted model. Reliable fine-tuning would require an eligible training setup and a human-reviewed evaluation set. Hosted providers can impose rate limits; a rate-limited request may need to be retried after the wait period stated in the error.
 
 ## Cognition-inspired design
 
@@ -49,7 +55,7 @@ MrTrench is an application built around a hosted language model, not a newly tra
 
 - **Working set and persistent memory:** chat and background review each retrieve a small cue-relevant set of thought threads and memories. Memory ranking combines lexical relevance, recency, importance, and confidence. This first version uses lightweight word matching, not embeddings or neural signals.
 - **Reactivation and reflection:** a new conversation cue can bring a suspended thread back into view. Background reflections must cite IDs of retrieved memories, and those evidence IDs are saved with the reflection. The background process is a scheduled model call, not continuous awareness.
-- **Temporary affect cue:** the chat model can record a tentative affect label for up to eight hours. Neutral or low-confidence interpretations clear it. It is included only to help the next reply choose a considerate tone; it is not a diagnosis, stable personality profile, or reason by itself to initiate contact.
+- **Temporary affect cue:** the chat model can record a tentative affect label, subject, cause, and evidence quote for up to eight hours. Neutral or low-confidence interpretations clear it. It is not a diagnosis or stable personality profile. A check-in needs a high-confidence cue grounded in recent user-authored text; assistant-directed frustration also needs a related unresolved help exchange.
 - **Separate attention and action gates:** the model can propose an unsolicited message, but application rules still enforce the user's pause, relevance and novelty thresholds, cooldown, and daily limit. Explicit reminders remain separate from discretionary check-ins.
 - **Human-centered voice:** MrTrench aims to be warm, specific, honest, and useful. It must not claim human feelings or consciousness, manufacture a private life, flatter to retain attention, or pressure someone into continuing. The goal is trust and helpfulness, not emotional dependence.
 
